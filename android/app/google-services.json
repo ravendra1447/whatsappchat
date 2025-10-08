@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "321530262085",
+    "project_id": "chatapp-4e2d5",
+    "storage_bucket": "chatapp-4e2d5.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:321530262085:android:b7d061a3b5064d034c692c",
+        "android_client_info": {
+          "package_name": "com.royal.whatsappchat.whatsappchat"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCwxrc9tlqIkChx_kUxSMk_Z8ppANhIokc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
