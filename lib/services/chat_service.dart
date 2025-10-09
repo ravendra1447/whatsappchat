@@ -220,6 +220,16 @@ class ChatService {
         }
       });
 
+      // ✅ ✅ ✅ YAHAN ADD KARO - media_upload_progress ke baad
+      _socket!.on("media_message_ready", (data) async {
+        print("📨 MEDIA MESSAGE READY RECEIVED:");
+        print("   Data: ${jsonEncode(data)}");
+
+        // ✅ Handle instant media message delivery
+        await _handleIncomingData(data, source: "media_message_ready", forceDelivered: true);
+      });
+
+
       _socket!.connect();
     } catch (e) {
       print("❌ Socket init error: $e");
@@ -253,7 +263,6 @@ class ChatService {
   }
 
   // ------------------- HANDLE INCOMING DATA - COMPLETELY FIXED -------------------
-// ------------------- HANDLE INCOMING DATA - COMPLETELY FIXED -------------------
   static Future<void> _handleIncomingData(dynamic data,
       {String source = "", bool forceDelivered = false}) async {
     try {
@@ -278,37 +287,47 @@ class ChatService {
         _processedMessageIds.remove(idToProcess);
       });
 
+      // ✅ FIX: Handle tempId to messageId conversion FIRST
       if (tempId != null && messageId != null) {
-        await updateMessageId(tempId, messageId, 0);
-        print("✅ TempId $tempId replaced with messageId: $messageId");
+        await updateMessageId(tempId, messageId, forceDelivered ? 1 : 0);
+        print("✅ TempId converted: $tempId -> $messageId");
+
+        // After conversion, use the new messageId for further processing
+        final existingMessage = _messageBox.values.firstWhereOrNull(
+              (msg) => msg.messageId == messageId,
+        );
+
+        if (existingMessage != null) {
+          print("⚠️ Message already exists with new ID: $messageId");
+          return;
+        }
       }
 
+      // Check if message exists (using the final ID)
       final existingMessage = _messageBox.values.firstWhereOrNull(
             (msg) => msg.messageId == idToProcess,
       );
 
       if (existingMessage != null) {
-        print("⚠️ Message with ID $idToProcess already exists. Skipping save.");
+        print("⚠️ Message exists: $idToProcess");
         return;
       }
 
+      // Process message content
       String messageContent = data["message_text"] ?? "";
       String mediaUrl = data["media_url"]?.toString() ?? "";
       String messageType = data["message_type"]?.toString() ?? "text";
       String finalContent = messageContent;
       String finalMessageType = messageType;
 
-      print("📥 Incoming message details:");
+      print("📥 Processing message from $source:");
       print("   Type: $messageType");
       print("   Media URL: $mediaUrl");
-      print("   Text content: ${messageContent.length > 100 ? messageContent.substring(0, 100) + '...' : messageContent}");
+      print("   Temp ID: $tempId");
+      print("   Message ID: $messageId");
 
-      // ✅ FIXED: Handle all message types properly
       if (messageType == "encrypted") {
-        // Encrypted text message - but check if it's actually media
         try {
-          print("🔐 Attempting to decrypt message...");
-
           // ✅ FIRST: Check if this is actually a media message disguised as encrypted
           if (mediaUrl.isNotEmpty && messageContent == "media") {
             print("🔄 Detected media message in encrypted format");
@@ -318,7 +337,7 @@ class ChatService {
             print("✅ Converted to media message: $finalContent");
           }
           else {
-            // Try actual decryption
+            // Try actual decryption for text messages
             final decryptedData = await _cryptoManager.decryptAndDecompress(messageContent);
             final decodedData = jsonDecode(decryptedData['content']);
             finalContent = decodedData['content'] ?? "[Decryption Failed]";
@@ -327,37 +346,37 @@ class ChatService {
           }
         } catch (e) {
           print("❌ Decryption failed: $e");
-
           // ✅ FALLBACK: If decryption fails but we have media URL, treat as media
           if (mediaUrl.isNotEmpty) {
-            print("🔄 Fallback: Using media URL since decryption failed");
             final fileName = mediaUrl.split('/').last;
             finalContent = '${Config.baseNodeApiUrl}/media/file/$fileName';
             finalMessageType = "media";
           } else {
             finalContent = "[Decryption Failed]";
-            finalMessageType = "text";
           }
         }
       }
       else if (messageType == "media") {
         // ✅ Media message - server sends media_url directly
         if (mediaUrl.isNotEmpty) {
-          // Server automatically decrypts via /media/file/:filename endpoint
           final fileName = mediaUrl.split('/').last;
 
           // ✅ IMPORTANT: Check if it's already a full URL
           if (mediaUrl.startsWith('http')) {
-            finalContent = mediaUrl; // Use as-is if already full URL
+            finalContent = mediaUrl;
           } else {
             finalContent = '${Config.baseNodeApiUrl}/media/file/$fileName';
           }
 
           finalMessageType = "media";
-          print("✅ Media message processed:");
-          print("   Original URL: $mediaUrl");
-          print("   Final URL: $finalContent");
-          print("   File Name: $fileName");
+
+          // ✅ FIX: Check if this is replacing a temporary message
+          if (tempId != null && tempId.startsWith('temp_')) {
+            print("🔄 Replacing temporary media message: $tempId");
+            // Temporary message will be automatically replaced via updateMessageId
+          }
+
+          print("✅ Media message processed: $finalContent");
 
           // Test the media URL
           await _testMediaUrl(finalContent);
@@ -380,9 +399,9 @@ class ChatService {
         finalMessageType = "text";
       }
 
-      // Create message
+      // Create and save message
       final msg = Message(
-        messageId: idToProcess,
+        messageId: idToProcess, // This will be the final messageId after conversion
         chatId: int.tryParse(data["chat_id"]?.toString() ?? "0") ?? 0,
         senderId: int.tryParse(data["sender_id"]?.toString() ?? "0") ?? 0,
         receiverId: int.tryParse(data["receiver_id"]?.toString() ?? "0") ?? 0,
@@ -390,8 +409,7 @@ class ChatService {
         messageType: finalMessageType,
         isRead: 0,
         isDelivered: forceDelivered ? 1 : 0,
-        timestamp: DateTime.tryParse(data["timestamp"]?.toString() ?? "") ??
-            DateTime.now(),
+        timestamp: DateTime.tryParse(data["timestamp"]?.toString() ?? "") ?? DateTime.now(),
         senderName: data["sender_name"]?.toString(),
         receiverName: data["receiver_name"]?.toString(),
         senderPhoneNumber: data["sender_phone"]?.toString(),
@@ -399,31 +417,27 @@ class ChatService {
       );
 
       await saveMessageLocal(msg);
-      print("💾 Saved message locally:");
-      print("   ID: $idToProcess");
-      print("   Type: $finalMessageType");
-      print("   Content: $finalContent");
+      print("💾 Message saved: $idToProcess");
+
+      // Notify UI
       _newMessageController.add(msg);
 
-      // Send delivery confirmation if message is for current user
-      if (currentUserId.toString() != data["sender_id"].toString()) {
-        if (_socket != null && _socket!.connected) {
-          _socket!.emit("message_delivered", {
-            "message_id": idToProcess,
-            "chat_id": msg.chatId,
-            "receiver_id": currentUserId,
-          });
-          print("📤 Notified server: message delivered, id=$idToProcess");
-          SoundUtils.playDeliveredSound();
+      // Send delivery confirmation
+      final isForCurrentUser = currentUserId.toString() != data["sender_id"].toString();
+      if (isForCurrentUser && _socket != null && _socket!.connected) {
+        _socket!.emit("message_delivered", {
+          "message_id": idToProcess,
+          "chat_id": msg.chatId,
+          "receiver_id": currentUserId,
+        });
 
-          await updateDeliveryStatus(idToProcess, 1);
-        }
+        await updateDeliveryStatus(idToProcess, 1);
+        print("📤 Delivery confirmed: $idToProcess");
       }
 
     } catch (e, st) {
-      print("⚠️ Critical error parsing incoming message ($source): $e");
-      print("Raw data: $data");
-      print("Stacktrace: $st");
+      print("❌ Error in _handleIncomingData: $e");
+      print("Stack: $st");
     }
   }
 
@@ -575,10 +589,13 @@ class ChatService {
     }
   }
 
+  // ChatService.dart mein getLocalMessages function update karo
+
   static List<Message> getLocalMessages(int chatId) {
     try {
       return _messageBox.values
           .where((m) => m.chatId == chatId)
+          .where((m) => !m.messageId.toString().startsWith('temp_')) // ✅ Temporary messages filter
           .cast<Message>()
           .toList()
         ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
@@ -673,6 +690,7 @@ class ChatService {
     String? senderPhoneNumber,
     String? receiverPhoneNumber,
   }) async {
+    final tempId = 'temp_${chatId}_${DateTime.now().microsecondsSinceEpoch}';
     if (!_isInitialized) {
       throw Exception("ChatService has not been initialized. Cannot send media message.");
     }
@@ -686,7 +704,7 @@ class ChatService {
       }
     }
 
-    final tempId = 'temp_${DateTime.now().microsecondsSinceEpoch}';
+    //final tempId = 'temp_${DateTime.now().microsecondsSinceEpoch}';
     final userId = _authBox.get('userId');
     if (userId == null) throw Exception("User ID not found");
 
@@ -736,6 +754,8 @@ class ChatService {
   }
 
   /// Background processing and uploading of media - CORRECTED FOR SERVER API
+// ChatService.dart mein _processAndSendMedia function update karo
+
   static Future<void> _processAndSendMedia({
     required String mediaPath,
     required int chatId,
@@ -755,12 +775,18 @@ class ChatService {
     _uploadingMediaIds.add(tempId);
 
     try {
-      // ✅ STEP 1: Compress media
+      // ✅ STEP 1: Check if temp message exists
+      final existingTempMsg = _messageBox.get(tempId) as Message?;
+      if (existingTempMsg == null) {
+        print("❌ Temporary message not found");
+        return;
+      }
+
+      // ✅ STEP 2: Compress media
       Uint8List fileBytes;
       final ext = mediaPath.split('.').last.toLowerCase();
 
       if (['jpg', 'jpeg', 'png', 'webp'].contains(ext)) {
-        // Compress image
         final compressedBytes = await FlutterImageCompress.compressWithFile(
           mediaPath,
           quality: 60,
@@ -769,7 +795,6 @@ class ChatService {
         );
         fileBytes = Uint8List.fromList(compressedBytes ?? await File(mediaPath).readAsBytes());
       } else if (['mp4', 'mov', 'avi', 'mkv'].contains(ext)) {
-        // Compress video
         final MediaInfo? info = await VideoCompress.compressVideo(
           mediaPath,
           quality: VideoQuality.MediumQuality,
@@ -790,7 +815,7 @@ class ChatService {
 
       print("📦 Prepared media for upload: $originalName ($totalSize bytes)");
 
-      // ✅ STEP 2: Upload using server's 3-step process
+      // ✅ STEP 3: Upload using server's 3-step process
       final String? mediaUrl = await _uploadMediaToServer(
           fileBytes,
           originalName,
@@ -813,35 +838,56 @@ class ChatService {
 
       print("✅ Media uploaded successfully: $mediaUrl");
 
-      // ✅ STEP 3: Update local message with final URL
-      final finalMsg = _messageBox.get(tempId) as Message?;
-      if (finalMsg != null) {
-        // Convert relative URL to full URL for display
-        final fileName = mediaUrl.split('/').last;
-        final fullMediaUrl = '${Config.baseNodeApiUrl}/media/file/$fileName';
-        finalMsg.messageContent = fullMediaUrl;
-        finalMsg.messageType = 'media';
-        await saveMessageLocal(finalMsg);
-        _newMessageController.add(finalMsg);
+      // ✅ STEP 4: CRITICAL FIX - Send final media message via socket (jaise text message bhejte hain)
+      final fileName = mediaUrl.split('/').last;
+      final fullMediaUrl = '${Config.baseNodeApiUrl}/media/file/$fileName';
 
-        print("✅ Updated local message with final media URL: $fullMediaUrl");
+      // ✅ Prepare encrypted payload for media (jaise text ke liye karte hain)
+      final Map<String, dynamic> mediaPayload = {
+        'type': 'media',
+        'content': fullMediaUrl,
+      };
 
-        // Test the media URL
-        await _testMediaUrl(fullMediaUrl);
+      final String payloadString = jsonEncode(mediaPayload);
+      final encryptedData = await _cryptoManager.encryptAndCompress(payloadString);
+      final encryptedContent = encryptedData['content'];
+      final encryptedType = encryptedData['type'];
+
+      // ✅ Send via socket EXACTLY like text message
+      if (_socket != null && _socket!.connected) {
+        _socket!.emit("send_message", {
+          "chat_id": chatId,
+          "sender_id": userId,
+          "receiver_id": receiverId,
+          "message_text": encryptedContent,
+          "message_type": encryptedType,
+          "temp_id": tempId,
+          "media_url": fullMediaUrl, // ✅ ADD media_url for instant delivery
+          "sender_name": senderName,
+          "receiver_name": receiverName,
+          "sender_phone": senderPhoneNumber,
+          "receiver_phone": receiverPhoneNumber,
+          "timestamp": DateTime.now().toIso8601String(),
+        });
+        print("📤 Emitted send_message for media with temp_id: $tempId");
       }
 
-      // ✅ STEP 4: Send push notification
-      await _sendPushNotification(receiverId, '📷 Media', chatId, userId, senderName ?? 'User');
+      // ✅ STEP 5: Update local temporary message
+      existingTempMsg.messageContent = fullMediaUrl;
+      existingTempMsg.isDelivered = 1;
+      await _messageBox.put(tempId, existingTempMsg);
+      _newMessageController.add(existingTempMsg);
 
-      print("✅ Media processed, uploaded, and sent: $tempId");
+      print("✅ Media message sent and local temp message updated: $fullMediaUrl");
+
+      // ✅ STEP 6: Send push notification
+      await _sendPushNotification(receiverId, '📷 Media', chatId, userId, senderName ?? 'User');
 
     } catch (e) {
       print("❌ Media upload error: $e");
-
-      // Mark as failed in progress stream
       _uploadProgressController.sink.add({
         'tempId': tempId,
-        'progress': -1.0, // -1 indicates error
+        'progress': -1.0,
       });
     } finally {
       _uploadingMediaIds.remove(tempId);
@@ -933,6 +979,7 @@ class ChatService {
           data: {
             "upload_id": uploadId,
             "receiver_id": receiverId,
+            "temp_id": tempId,
           }
       );
 

@@ -1,9 +1,11 @@
 // lib/pages/chat_screen.dart
 
+import 'dart:convert';
 import 'dart:io';
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:hive/hive.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -58,7 +60,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final ImagePicker _imagePicker = ImagePicker();
   final FocusNode _focusNode = FocusNode();
 
-  Set<int> selectedMessageIds = {};
+  Set<String> selectedMessageIds = {};
   final ScrollController _scrollController = ScrollController();
   File? _imageFile;
   final _messageBox = Hive.box<Message>('messages');
@@ -83,11 +85,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _shouldScrollToBottom = true;
   bool _hasInitialScrollDone = false;
 
+  // ✅ Add this constant for API base URL
+  static const String apiBase = "http://184.168.126.71/api";
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-
 
     ChatService.initSocket();
     ChatService.ensureConnected();
@@ -199,14 +203,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (!_scrollController.hasClients) return;
     final maxScroll = _scrollController.position.maxScrollExtent;
     if (maxScroll <= 0) return;
-    _scrollController.jumpTo(maxScroll);
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients && _shouldScrollToBottom) {
+        _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+      }
+    });
   }
 
   void _updateScrollToBottomPreference() {
     if (!_scrollController.hasClients) return;
     final double currentOffset = _scrollController.offset;
     final double maxOffset = _scrollController.position.maxScrollExtent;
-    final double threshold = 150.0;
+    final double threshold = 100.0;
+
     setState(() {
       _shouldScrollToBottom = (maxOffset - currentOffset) <= threshold;
     });
@@ -285,16 +295,104 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         _otherUserPhone = phone;
         _resolvedTitle = title;
       });
-    } catch (_) {
-      // ignore
+    } catch (e) {
+      print("Error in resolveHeader: $e");
     }
   }
 
   Future<void> _fetchMessages() async {
     try {
-      await ChatService.fetchMessages(widget.chatId);
+      final localMessages = ChatService.getLocalMessages(widget.chatId);
+
+      final validMessages = localMessages.where((msg) =>
+      !msg.messageId.toString().startsWith('temp_')
+      ).toList();
+
+      if (validMessages.isNotEmpty) {
+        print("✅ Using ${validMessages.length} valid local messages for chat ${widget.chatId}");
+        setState(() {});
+        return;
+      }
+
+      final res = await http.get(Uri.parse("$apiBase/get_messages.php?chat_id=${widget.chatId}"));
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        if (data["success"] == true && data["messages"] != null) {
+          for (var msg in data["messages"]) {
+            if (msg["temp_id"] == null && !msg["message_id"].toString().startsWith('temp_')) {
+              await _handleIncomingData(msg);
+            }
+          }
+          print("✅ Messages loaded for chatId=${widget.chatId}: ${data["messages"].length}");
+          if (mounted) setState(() {});
+        }
+      }
     } catch (e) {
-      print("Error fetching messages: $e");
+      print("❌ Fetch messages error: $e");
+    }
+  }
+
+  Future<void> _handleIncomingData(dynamic data) async {
+    try {
+      final messageId = data["message_id"]?.toString();
+      final tempId = data["temp_id"]?.toString();
+      final idToProcess = messageId ?? tempId;
+
+      if (idToProcess == null) {
+        print("❌ Incoming data has no valid message_id or temp_id");
+        return;
+      }
+
+      final existingMessage = _messageBox.values.firstWhereOrNull(
+            (msg) => msg.messageId == idToProcess,
+      );
+
+      if (existingMessage != null) {
+        print("⚠️ Message with ID $idToProcess already exists. Skipping.");
+        return;
+      }
+
+      final msg = Message(
+        messageId: idToProcess,
+        chatId: int.tryParse(data["chat_id"]?.toString() ?? "0") ?? 0,
+        senderId: int.tryParse(data["sender_id"]?.toString() ?? "0") ?? 0,
+        receiverId: int.tryParse(data["receiver_id"]?.toString() ?? "0") ?? 0,
+        messageContent: data["message_text"]?.toString() ?? "",
+        messageType: data["message_type"]?.toString() ?? "text",
+        isRead: 0,
+        isDelivered: 0,
+        timestamp: DateTime.tryParse(data["timestamp"]?.toString() ?? "") ?? DateTime.now(),
+        senderName: data["sender_name"]?.toString(),
+        receiverName: data["receiver_name"]?.toString(),
+        senderPhoneNumber: data["sender_phone"]?.toString(),
+        receiverPhoneNumber: data["receiver_phone"]?.toString(),
+      );
+
+      await ChatService.saveMessageLocal(msg);
+      print("💾 Saved incoming message: $idToProcess");
+
+    } catch (e) {
+      print("❌ Error handling incoming data: $e");
+    }
+  }
+
+  void _clearTemporaryMessages() {
+    try {
+      final temporaryMessages = _messageBox.values.where((msg) =>
+      msg.chatId == widget.chatId &&
+          msg.messageId.toString().startsWith('temp_')
+      ).toList();
+
+      for (var tempMsg in temporaryMessages) {
+        _messageBox.delete(tempMsg.messageId);
+      }
+
+      if (temporaryMessages.isNotEmpty) {
+        print("🧹 Cleared ${temporaryMessages.length} temporary messages for chat ${widget.chatId}");
+      }
+    } catch (e) {
+      print("❌ Error clearing temporary messages: $e");
     }
   }
 
@@ -315,6 +413,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _typingTimer?.cancel();
   }
 
+  // 🔥 FIXED: FAST MEDIA MESSAGE SENDING
   Future<void> _sendMessage() async {
     if (_isSending) {
       return;
@@ -327,17 +426,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     setState(() {
       _isSending = true;
+      _shouldScrollToBottom = true;
     });
 
     try {
       if (_imageFile != null) {
-        await ChatService.sendMediaMessage(
+        // ✅ INSTANT MEDIA SENDING
+        print("🚀 Sending media instantly...");
+
+        // Force scroll immediately
+        _jumpToBottom();
+
+        // Send media in background
+        ChatService.sendMediaMessage(
           chatId: widget.chatId,
           receiverId: widget.otherUserId,
           mediaPath: _imageFile!.path,
+          senderName: _authBox.get('userName'),
+          receiverName: _resolvedTitle.isNotEmpty ? _resolvedTitle : widget.otherUserName,
+          senderPhoneNumber: _authBox.get('userPhone'),
+          receiverPhoneNumber: _otherUserPhone ?? _authBox.get('otherUserPhone'),
         );
+
         setState(() => _imageFile = null);
       } else {
+        // Text message
         await ChatService.sendMessage(
           chatId: widget.chatId,
           receiverId: widget.otherUserId,
@@ -348,15 +461,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           senderPhoneNumber: _authBox.get('userPhone'),
           receiverPhoneNumber: _otherUserPhone ?? _authBox.get('otherUserPhone'),
         );
+
+        _controller.clear();
       }
 
-      _controller.clear();
       _resolveHeader();
 
-      setState(() {
-        _shouldScrollToBottom = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _jumpToBottom();
       });
-      _jumpToBottom();
+
     } catch (e) {
       print("Error sending message: $e");
     } finally {
@@ -380,6 +494,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           _imageFile = File(pickedFile.path);
           _focusNode.unfocus();
         });
+
+        // Auto-send after picking image
+        _sendMessage();
       }
     } catch (e) {
       print("Error picking image: $e");
@@ -387,6 +504,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _forwardMessages() async {
+    if (selectedMessageIds.isEmpty) return;
+
     final targetChatId = await Navigator.push(
       context,
       MaterialPageRoute(
@@ -395,8 +514,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
 
     if (targetChatId != null && targetChatId is int) {
+      // ✅ FIX: Convert string IDs to int for forwarding
+      final messageIdsForForwarding = selectedMessageIds
+          .map((id) => int.tryParse(id) ?? 0)
+          .where((id) => id != 0)
+          .toSet();
+
       await ChatService.forwardMessages(
-        originalMessageIds: selectedMessageIds,
+        originalMessageIds: messageIdsForForwarding,
         targetChatId: targetChatId,
       );
 
@@ -410,11 +535,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _showDeleteConfirmation(int messageIntId) async {
-    final message = _messageBox.values.firstWhereOrNull((m) => int.tryParse(m.messageId) == messageIntId);
+  Future<void> _showDeleteConfirmation(String messageId) async {
+    final message = _messageBox.values.firstWhereOrNull((m) => m.messageId == messageId);
     if (message == null) return;
-
-    final String messageIdString = message.messageId;
 
     final userId = LocalAuthService.getUserId();
     final isMe = message.senderId == userId;
@@ -447,7 +570,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (userId == null) return;
 
       await ChatService.deleteMessage(
-        messageId: messageIdString,
+        messageId: messageId,
         userId: userId,
         role: deleteRole,
       );
@@ -458,10 +581,99 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  Widget _buildMediaMessage(Message msg, String mediaUrl, Color textColor) {
-    print("📸 Building media message - URL: $mediaUrl");
+  // ✅ MEDIA LOADING WIDGET
+  Widget _buildMediaLoading() {
+    return Container(
+      color: Colors.grey[200],
+      child: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(height: 8),
+            Text('Loading...', style: TextStyle(fontSize: 12)),
+          ],
+        ),
+      ),
+    );
+  }
 
-    // ✅ Check if URL is valid and accessible
+  // ✅ MEDIA ERROR WIDGET
+  Widget _buildMediaError(String url, String error) {
+    return Container(
+      color: Colors.grey[300],
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.error_outline, color: Colors.red, size: 40),
+          SizedBox(height: 8),
+          Text('Failed to load', style: TextStyle(fontSize: 12)),
+          SizedBox(height: 4),
+          Text(
+            'Tap to retry',
+            style: TextStyle(fontSize: 10, color: Colors.grey[600]),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ✅ LOCAL MEDIA PREVIEW
+  Widget _buildLocalMediaPreview(String localPath) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        width: 200,
+        height: 200,
+        child: Stack(
+          children: [
+            Image.file(
+              File(localPath),
+              fit: BoxFit.cover,
+              width: 200,
+              height: 200,
+              errorBuilder: (context, error, stackTrace) {
+                return _buildMediaError(localPath, error.toString());
+              },
+            ),
+            // ✅ UPLOADING INDICATOR
+            Container(
+              color: Colors.black54,
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    CircularProgressIndicator(
+                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                    ),
+                    SizedBox(height: 8),
+                    Text(
+                      'Sending...',
+                      style: TextStyle(color: Colors.white, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMediaMessage(Message msg, String mediaUrl, Color textColor) {
+    print("📸 Building media message - URL: $mediaUrl | Type: ${msg.messageType}");
+
+    // ✅ LOCAL FILE CHECK (Temporary media)
+    if (mediaUrl.startsWith('/') ||
+        mediaUrl.contains('cache') ||
+        mediaUrl.contains('temp_') ||
+        (File(mediaUrl).existsSync() && !mediaUrl.startsWith('http'))) {
+
+      return _buildLocalMediaPreview(mediaUrl);
+    }
+
+    // ✅ SERVER MEDIA URL CHECK
     if (mediaUrl.isEmpty ||
         mediaUrl == "[Media URL Missing]" ||
         mediaUrl == "[Media Decryption Failed]" ||
@@ -485,20 +697,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               'Media not available',
               style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
-            SizedBox(height: 4),
-            Text(
-              mediaUrl,
-              style: TextStyle(fontSize: 10, color: Colors.grey[700]),
-              textAlign: TextAlign.center,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
           ],
         ),
       );
     }
 
-    // ✅ Use CachedNetworkImage for server media
+    // ✅ SERVER MEDIA - Use CachedNetworkImage
     return ClipRRect(
       borderRadius: BorderRadius.circular(8),
       child: Container(
@@ -506,39 +710,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         height: 200,
         child: CachedNetworkImage(
           imageUrl: mediaUrl,
-          placeholder: (context, url) => Container(
-            color: Colors.grey[200],
-            child: Center(
-              child: CircularProgressIndicator(),
-            ),
-          ),
-          errorWidget: (context, url, error) {
-            print("❌ CachedNetworkImage error: $error, URL: $url");
-
-            return GestureDetector(
-              onTap: () {
-                // Force refresh
-                setState(() {});
-              },
-              child: Container(
-                color: Colors.grey[300],
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.refresh, color: Colors.blue, size: 40),
-                    SizedBox(height: 8),
-                    Text('Tap to retry'),
-                    SizedBox(height: 4),
-                    Text(
-                      'Error: $error',
-                      style: TextStyle(fontSize: 10),
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
-                ),
-              ),
-            );
-          },
+          placeholder: (context, url) => _buildMediaLoading(),
+          errorWidget: (context, url, error) => _buildMediaError(url, error.toString()),
           fit: BoxFit.cover,
           width: 200,
           height: 200,
@@ -547,12 +720,24 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
+  // 🔥 FIXED: _buildMessageBubble function
   Widget _buildMessageBubble(Message msg, {Key? key}) {
-    final int msgId = int.tryParse(msg.messageId.toString()) ?? 0;
+    final String msgId = msg.messageId.toString();
     final bool isSelected = selectedMessageIds.contains(msgId);
 
     final userId = LocalAuthService.getUserId();
     final bool isMe = msg.senderId == userId;
+
+    // ✅ FIX: Temporary media messages ko show karo (both uploading and final)
+    if (msg.messageId.toString().startsWith('temp_') && msg.messageType == 'media') {
+      // Show the media message with proper content using new method
+      return _buildMediaMessageBubble(msg, isMe: isMe, isSelected: isSelected);
+    }
+
+    // ❌ REMOVE THIS BLOCK - Temporary non-media messages ko hide karo
+    // if (msg.messageId.toString().startsWith('temp_') && msg.messageType != 'media') {
+    //   return const SizedBox.shrink();
+    // }
 
     if ((isMe && msg.isDeletedSender == 1) || (!isMe && msg.isDeletedReceiver == 1)) {
       return const SizedBox.shrink();
@@ -561,7 +746,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final color = isMe ? const Color(0xFFDCF8C6) : Colors.white;
     final textColor = Colors.black;
 
-    // Message delete for everyone हुआ है, लेकिन लोकल में बाकी है
     final bool contentDeleted = !isMe && msg.isDeletedSender == 1;
     final String content = contentDeleted ? '❌ This message was deleted' : msg.messageContent;
     final messageType = msg.messageType;
@@ -574,19 +758,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
 
     return GestureDetector(
-      behavior: HitTestBehavior.translucent,
+      behavior: HitTestBehavior.opaque,
       onTap: () {
         if (selectedMessageIds.isNotEmpty) {
-          setState(() => selectedMessageIds.clear());
+          setState(() {
+            selectedMessageIds.clear();
+          });
         } else if (_focusNode.hasFocus) {
           _focusNode.unfocus();
         }
       },
       onLongPress: () {
         setState(() {
-          if (isSelected) {
+          if (selectedMessageIds.contains(msgId)) {
             selectedMessageIds.remove(msgId);
           } else {
+            selectedMessageIds.clear();
             selectedMessageIds.add(msgId);
           }
         });
@@ -664,6 +851,89 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                               size: 16,
                               color: Colors.black54,
                             ),
+                        ],
+                      ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ✅ ✅ ✅ YAHAN ADD KARO - _buildMessageBubble ke baad immediately
+  Widget _buildMediaMessageBubble(Message msg, {required bool isMe, required bool isSelected}) {
+    final color = isMe ? const Color(0xFFDCF8C6) : Colors.white;
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () {
+        if (selectedMessageIds.isNotEmpty) {
+          setState(() {
+            selectedMessageIds.clear();
+          });
+        } else if (_focusNode.hasFocus) {
+          _focusNode.unfocus();
+        }
+      },
+      child: Container(
+        decoration: BoxDecoration(
+          border: isSelected ? Border.all(color: Colors.lightGreen, width: 2) : null,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Align(
+          alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+          child: Container(
+            margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+            padding: const EdgeInsets.all(6),
+            constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+            decoration: BoxDecoration(
+              color: color,
+              borderRadius: BorderRadius.only(
+                topLeft: isMe ? const Radius.circular(16) : const Radius.circular(2),
+                topRight: isMe ? const Radius.circular(2) : const Radius.circular(16),
+                bottomLeft: const Radius.circular(16),
+                bottomRight: const Radius.circular(16),
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.grey.withOpacity(0.1),
+                  spreadRadius: 1,
+                  blurRadius: 2,
+                  offset: const Offset(0, 1),
+                ),
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Media Content
+                _buildMediaMessage(msg, msg.messageContent, Colors.black),
+
+                const SizedBox(height: 4),
+
+                // Time and Status
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      _formatTime(msg.timestamp),
+                      style: const TextStyle(color: Colors.black54, fontSize: 12),
+                    ),
+                    if (isMe) const SizedBox(width: 4),
+                    if (isMe)
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (msg.isRead == 1)
+                            const Icon(Icons.done_all, size: 16, color: Colors.blue)
+                          else if (msg.isDelivered == 1)
+                            const Icon(Icons.done_all, size: 16, color: Colors.black54)
+                          else
+                            const Icon(Icons.done, size: 16, color: Colors.black54),
                         ],
                       ),
                   ],
@@ -864,6 +1134,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           if (_focusNode.hasFocus) {
             _focusNode.unfocus();
           }
+          // ✅ Body pe tap karte hi selection clear ho
+          if (selectedMessageIds.isNotEmpty) {
+            setState(() {
+              selectedMessageIds.clear();
+            });
+          }
         },
         behavior: HitTestBehavior.translucent,
         child: Container(
@@ -882,6 +1158,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   builder: (context, box, child) {
                     final messages = box.values
                         .where((msg) => msg.chatId == widget.chatId)
+                    // ✅ TEMPORARY MEDIA MESSAGES KO ALLOW KARO
+                        .where((msg) => !msg.messageId.toString().startsWith('temp_') ||
+                        (msg.messageId.toString().startsWith('temp_') && msg.messageType == 'media'))
                         .toList();
 
                     if (messages.isEmpty) {
@@ -896,7 +1175,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     return CustomScrollView(
                       controller: _scrollController,
                       reverse: false,
-                      physics: const ClampingScrollPhysics(),
+                      physics: const AlwaysScrollableScrollPhysics(),
                       slivers: groupedMessages.entries.map((entry) {
                         final dateHeader = entry.key;
                         final dailyMessages = entry.value;
