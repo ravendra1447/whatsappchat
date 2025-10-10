@@ -6,10 +6,11 @@ import 'package:hive/hive.dart';
 import 'package:flutter_contacts/flutter_contacts.dart' as fc;
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:flutter/scheduler.dart';
-import 'package:collection/collection.dart'; // Add this import
-import 'package:firebase_messaging/firebase_messaging.dart'; // Add this import
+import 'package:collection/collection.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart'; // Add this import
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:convert';
 
 import '../services/chat_service.dart';
 import '../services/local_auth_service.dart';
@@ -19,9 +20,8 @@ import '../services/contact_service.dart';
 import '../services/my_firebase_messaging_service.dart';
 import 'chat_screen.dart';
 import 'new_chat_page.dart';
-import '../config.dart'; // Add this import
+import '../config.dart';
 
-// ✅ This main stateful widget now manages the user status map
 class ChatHomePage extends StatefulWidget {
   const ChatHomePage({super.key});
 
@@ -31,13 +31,11 @@ class ChatHomePage extends StatefulWidget {
 
 class _ChatHomePageState extends State<ChatHomePage> {
   int _selectedIndex = 0;
-  // 🆕 ऑनलाइन/ऑफलाइन स्टेटस स्टोर करने के लिए एक मैप
   final Map<int, String> _userStatus = {};
   late StreamSubscription _userStatusSubscription;
-  bool _contactsSynced = false; // 🆕 Contacts sync status track करने के लिए
-  bool _notificationAsked = false; // 🆕 Notification permission asked track करने के लिए
+  bool _contactsSynced = false;
+  bool _notificationAsked = false;
 
-  // 🆕 _screens list now passes the userStatus map to ChatsTab
   late final List<Widget> _screens = [
     ChatsTab(userStatus: _userStatus),
     const GroupsTab(),
@@ -49,7 +47,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
     super.initState();
     _startContactSync();
     _setupUserStatusListener();
-    ChatService.ensureConnected();// हर बार home खुलने पर online heartbeat चालू
+    ChatService.ensureConnected();
 
     final userId = LocalAuthService.getUserId();
     if (userId != null) {
@@ -57,16 +55,14 @@ class _ChatHomePageState extends State<ChatHomePage> {
     }
   }
 
-  // 🆕 New method to set up the status listener
   void _setupUserStatusListener() {
-    ChatService.ensureConnected(); // Ensure connection and status heartbeat
+    ChatService.ensureConnected();
     _userStatusSubscription = ChatService.onUserStatus.listen((statusData) {
       final userId = int.tryParse(statusData['userId']?.toString() ?? '');
       final status = statusData['status'] as String? ?? 'offline';
       if (userId != null) {
         setState(() {
           _userStatus[userId] = status;
-          print("UI Updated for user $userId, status: $status");
         });
       }
     });
@@ -99,156 +95,16 @@ class _ChatHomePageState extends State<ChatHomePage> {
       await ContactService.fetchPhoneContacts(ownerUserId: userId);
     }
 
-    // 🆕 Contacts sync complete होने के बाद notification permission ask करें
     setState(() {
       _contactsSynced = true;
     });
 
-    // 🆕 Contacts sync के बाद notification permission ask करें
-    //await _askNotificationPermission();
     await MyFirebaseMessagingService.initialize();
-  }
-
-  // 🆕 Notification Permission Logic
-  Future<void> _askNotificationPermission() async {
-    if (_notificationAsked) return;
-
-    // Contacts sync के बाद ही permission ask करें
-    if (!_contactsSynced) return;
-
-    debugPrint("🔔 Asking notification permission after contacts sync");
-
-    try {
-      final FirebaseMessaging messaging = FirebaseMessaging.instance;
-
-      // Notification settings get करें
-      NotificationSettings settings = await messaging.getNotificationSettings();
-
-      // Agar permission नहीं दी गई है, तो request करें
-      if (settings.authorizationStatus == AuthorizationStatus.notDetermined) {
-        await _showNotificationPermissionDialog();
-      } else {
-        debugPrint("Notification permission already: ${settings.authorizationStatus}");
-      }
-
-    } catch (e) {
-      debugPrint("Error asking notification permission: $e");
-    }
-
-    setState(() {
-      _notificationAsked = true;
-    });
-  }
-
-  Future<void> _showNotificationPermissionDialog() async {
-    final result = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Row(
-            children: [
-              Icon(Icons.notifications, color: Colors.blue),
-              SizedBox(width: 10),
-              Text("Enable Notifications"),
-            ],
-          ),
-          content: const Text(
-            "Allow whatsappchat to send you notifications?",
-            style: TextStyle(fontSize: 16),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop(false); // Don't Allow
-              },
-              child: const Text(
-                "Don't Allow",
-                style: TextStyle(color: Colors.grey),
-              ),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                Navigator.of(context).pop(true); // Allow
-              },
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.green,
-              ),
-              child: const Text("Allow"),
-            ),
-          ],
-        );
-      },
-    );
-
-    // User ने Allow दबाया तो permission request करें
-    if (result == true) {
-      await _requestNotificationPermission();
-    } else {
-      debugPrint("User denied notification permission");
-    }
-  }
-
-  Future<void> _requestNotificationPermission() async {
-    try {
-      final FirebaseMessaging messaging = FirebaseMessaging.instance;
-
-      NotificationSettings settings = await messaging.requestPermission(
-        alert: true,
-        badge: true,
-        sound: true,
-        criticalAlert: false,
-      );
-
-      debugPrint("Notification permission granted: ${settings.authorizationStatus}");
-
-      if (settings.authorizationStatus == AuthorizationStatus.authorized) {
-        // FCM token get करें
-        String? token = await messaging.getToken();
-        debugPrint("FCM Token: $token");
-
-        // Token को server पर save करें (अगर needed हो)
-        await _saveFCMTokenToServer(token);
-      }
-
-    } catch (e) {
-      debugPrint("Error requesting notification permission: $e");
-    }
-  }
-
-  Future<void> _saveFCMTokenToServer(String? token) async {
-    if (token == null) return;
-
-    try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      final userId = prefs.getInt('userId');
-
-      if (userId == null) return;
-
-      // अपने server API को call करें FCM token save करने के लिए
-      final response = await http.post(
-          Uri.parse("${Config.baseNodeApiUrl}/save_fcm_token"),
-          body: {
-            'user_id': userId.toString(),
-            'fcm_token': token,
-          }
-      );
-
-      if (response.statusCode == 200) {
-        debugPrint("✅ FCM token saved to server");
-      } else {
-        debugPrint("❌ Failed to save FCM token");
-      }
-
-    } catch (e) {
-      debugPrint("Error saving FCM token: $e");
-    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-
       appBar: AppBar(
         automaticallyImplyLeading: false,
         backgroundColor: const Color(0xFF075E54),
@@ -300,8 +156,6 @@ class _ChatHomePageState extends State<ChatHomePage> {
   }
 }
 
-/// ================= CHATS TAB =================
-// 🆕 ChatsTab is now a StatefulWidget to receive the status map
 class ChatsTab extends StatefulWidget {
   final Map<int, String> userStatus;
   const ChatsTab({super.key, required this.userStatus});
@@ -313,6 +167,47 @@ class ChatsTab extends StatefulWidget {
 class _ChatsTabState extends State<ChatsTab> {
   static final _cryptoManager = CryptoManager();
 
+  // ✅ WhatsApp style message display for home screen
+  String _getDisplayMessage(Message message) {
+    // ✅ Media message (encrypted or direct)
+    if (message.messageType == 'media' ||
+        message.messageType == 'encrypted_media' ||
+        (message.messageId.toString().startsWith('temp_') &&
+            message.messageType == 'media')) {
+      return "📷 Photo";
+    }
+
+    // ✅ Encrypted message - check if it's media
+    if (message.messageType == 'encrypted') {
+      try {
+        final decryptedData = _cryptoManager.decryptAndDecompress(message.messageContent);
+        final decodedData = jsonDecode(decryptedData.toString());
+        if (decodedData['type'] == 'media') {
+          return "📷 Photo";
+        }
+      } catch (e) {
+        // If decryption fails, check if it contains media indicators
+        if (message.messageContent.contains('media') || message.messageContent == 'media') {
+          return "📷 Photo";
+        }
+      }
+    }
+
+    // ✅ Regular text message - try to decrypt if encrypted
+    if (message.messageType == 'encrypted') {
+      try {
+        final decryptedData = _cryptoManager.decryptAndDecompress(message.messageContent);
+        final decodedData = jsonDecode(decryptedData.toString());
+        return decodedData['content'] ?? "Message";
+      } catch (e) {
+        return "Message";
+      }
+    }
+
+    // ✅ Plain text message
+    return message.messageContent.isNotEmpty ? message.messageContent : "Message";
+  }
+
   Future<Contact> _createContactFromMessage(
       Message message, int currentUserId) async {
     final otherUserId = message.senderId == currentUserId
@@ -323,7 +218,6 @@ class _ChatsTabState extends State<ChatsTab> {
         : message.senderPhoneNumber;
 
     String displayName = "";
-    String lastMessageContent = "Encrypted Message";
 
     if (otherUserPhone != null && otherUserPhone.isNotEmpty) {
       final localContactName =
@@ -350,19 +244,8 @@ class _ChatsTabState extends State<ChatsTab> {
       displayName = "User $otherUserId";
     }
 
-    if (message.messageType == 'encrypted' ||
-        message.messageType == 'encrypted_media') {
-      try {
-        final decryptedData =
-        await _cryptoManager.decryptAndDecompress(message.messageContent);
-        lastMessageContent = decryptedData['content'] as String;
-      } catch (e) {
-        lastMessageContent = "[Decryption Failed]";
-        print("❌ Decryption error for message ${message.messageId}: $e");
-      }
-    } else {
-      lastMessageContent = message.messageContent;
-    }
+    // ✅ Use the new display method
+    final lastMessageContent = _getDisplayMessage(message);
 
     return Contact(
       id: otherUserId,
@@ -401,8 +284,7 @@ class _ChatsTabState extends State<ChatsTab> {
           message.senderId == userId ? message.receiverId : message.senderId;
           if (otherUserId > 0) {
             if (!latestMessages.containsKey(otherUserId) ||
-                message.timestamp
-                    .isAfter(latestMessages[otherUserId]!.timestamp)) {
+                message.timestamp.isAfter(latestMessages[otherUserId]!.timestamp)) {
               latestMessages[otherUserId] = message;
             }
           }
@@ -444,10 +326,7 @@ class _ChatsTabState extends State<ChatsTab> {
                 itemCount: sortedContacts.length,
                 itemBuilder: (context, index) {
                   final contact = sortedContacts[index];
-                  // Find the correct latest message for this specific contact's chat
                   final latestMessage = latestMessages.values.firstWhereOrNull((msg) => msg.chatId == contact.chatId);
-
-                  // 🆕 Get the online status from the passed map
                   final isOnline = widget.userStatus[contact.id] == 'online';
 
                   return ListTile(
@@ -457,7 +336,6 @@ class _ChatsTabState extends State<ChatsTab> {
                           backgroundColor: Colors.grey,
                           child: const Icon(Icons.person, color: Colors.white),
                         ),
-                        // 🆕 Display online dot if user is online
                         if (isOnline)
                           Positioned(
                             right: 0,
@@ -480,7 +358,6 @@ class _ChatsTabState extends State<ChatsTab> {
                         if (latestMessage != null)
                           _buildTickIcon(latestMessage, userId),
                         const SizedBox(width: 4),
-                        // 🆕 Show 'Online' or 'Offline' status in subtitle
                         Expanded(
                           child: Text(
                             isOnline ? 'Online' : (contact.lastMessage ?? "No message"),
@@ -494,7 +371,7 @@ class _ChatsTabState extends State<ChatsTab> {
                       ],
                     ),
                     trailing: Text(
-                      "${contact.lastMessageTime.hour.toString().padLeft(2, '0')}:${contact.lastMessageTime.minute.toString().padLeft(2, '0')}",
+                      _formatTime(contact.lastMessageTime),
                       style: const TextStyle(fontSize: 12, color: Colors.grey),
                     ),
                     onTap: () {
@@ -526,7 +403,18 @@ class _ChatsTabState extends State<ChatsTab> {
     );
   }
 
-  /// Updated Tick Icon builder to show single, double, and blue ticks
+  String _formatTime(DateTime timestamp) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final messageDate = DateTime(timestamp.year, timestamp.month, timestamp.day);
+
+    if (today == messageDate) {
+      return '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')}';
+    } else {
+      return '${timestamp.day}/${timestamp.month}';
+    }
+  }
+
   Widget _buildTickIcon(Message message, int currentUserId) {
     if (message.senderId != currentUserId) {
       return const SizedBox.shrink();

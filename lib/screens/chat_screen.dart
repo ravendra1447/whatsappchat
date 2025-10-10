@@ -20,6 +20,7 @@ import '../services/chat_service.dart';
 import '../services/local_auth_service.dart';
 import '../services/contact_service.dart';
 import 'new_chat_page.dart';
+import 'media_viewer_screen.dart';
 
 // Helper function to format date headers
 String formatDateHeader(DateTime date) {
@@ -85,6 +86,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _shouldScrollToBottom = true;
   bool _hasInitialScrollDone = false;
 
+  // ✅ DUPLICATE PROTECTION
+  final Set<String> _processedMessageIds = {};
+
+  // ✅ WHATSAPP-LIKE IMAGE QUALITY SETTINGS
+  static const double _maxImageWidth = 1080;
+  static const double _maxImageHeight = 1920;
+  static const int _imageQuality = 90;
+
+  // ✅ PERMANENT FIX: Use Hive to store loaded status
+  bool get _areMessagesLoaded {
+    return _authBox.get('messages_loaded_${widget.chatId}', defaultValue: false) ?? false;
+  }
+
+  set _areMessagesLoaded(bool value) {
+    _authBox.put('messages_loaded_${widget.chatId}', value);
+  }
+
   // ✅ Add this constant for API base URL
   static const String apiBase = "http://184.168.126.71/api";
 
@@ -112,7 +130,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     Future.delayed(const Duration(milliseconds: 50), () async {
       ChatService.joinRoom(widget.chatId);
-      await _fetchMessages();
+
+      if (!_areMessagesLoaded) {
+        await _fetchMessages();
+      } else {
+        print("✅ Using previously loaded messages for chat ${widget.chatId}");
+        if (mounted) setState(() {});
+      }
+
       await _resolveHeader();
 
       SchedulerBinding.instance.addPostFrameCallback((_) {
@@ -131,12 +156,36 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
     });
 
+    // ✅ FIXED: STRONG DUPLICATE PROTECTION IN NEW MESSAGE LISTENER
     _newMessageSubscription = ChatService.onNewMessage.listen((msg) async {
       if (mounted && msg.chatId == widget.chatId) {
-        setState(() {});
-        await _resolveHeader();
-        if (_shouldScrollToBottom) {
-          _jumpToBottom();
+        // ✅ STRONG DUPLICATE CHECK - Multiple layers
+        if (_processedMessageIds.contains(msg.messageId)) {
+          print("⚠️ DUPLICATE BLOCKED in UI: ${msg.messageId}");
+          return;
+        }
+
+        _processedMessageIds.add(msg.messageId);
+
+        // Auto-clean after 30 seconds
+        Future.delayed(const Duration(seconds: 30), () {
+          _processedMessageIds.remove(msg.messageId);
+        });
+
+        // ✅ CHECK IN HIVE FIRST
+        final existingMessage = _messageBox.values.firstWhereOrNull(
+              (existingMsg) => existingMsg.messageId == msg.messageId && existingMsg.chatId == widget.chatId,
+        );
+
+        if (existingMessage == null) {
+          print("💾 New message from socket: ${msg.messageId}");
+          setState(() {});
+          await _resolveHeader();
+          if (_shouldScrollToBottom) {
+            _jumpToBottom();
+          }
+        } else {
+          print("⚠️ Duplicate message from socket: ${msg.messageId}");
         }
       }
     });
@@ -186,6 +235,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _statusSubscription?.cancel();
     _newMessageSubscription?.cancel();
     _scrollController.dispose();
+    _processedMessageIds.clear(); // ✅ CLEANUP
     super.dispose();
   }
 
@@ -300,36 +350,77 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
+  // ✅ FIXED: _fetchMessages with STRONG duplicate prevention
   Future<void> _fetchMessages() async {
     try {
       final localMessages = ChatService.getLocalMessages(widget.chatId);
 
-      final validMessages = localMessages.where((msg) =>
-      !msg.messageId.toString().startsWith('temp_')
-      ).toList();
-
-      if (validMessages.isNotEmpty) {
-        print("✅ Using ${validMessages.length} valid local messages for chat ${widget.chatId}");
-        setState(() {});
+      if (localMessages.length >= 5) {
+        print("✅ Using ${localMessages.length} local messages for chat ${widget.chatId}");
+        setState(() {
+          _areMessagesLoaded = true;
+        });
         return;
       }
+
+      print("🔄 Fetching messages from server for chat ${widget.chatId}");
 
       final res = await http.get(Uri.parse("$apiBase/get_messages.php?chat_id=${widget.chatId}"));
 
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         if (data["success"] == true && data["messages"] != null) {
+          int newMessagesCount = 0;
+          int duplicateCount = 0;
+
           for (var msg in data["messages"]) {
-            if (msg["temp_id"] == null && !msg["message_id"].toString().startsWith('temp_')) {
+            final messageId = msg["message_id"]?.toString();
+            final tempId = msg["temp_id"]?.toString();
+            final idToProcess = messageId ?? tempId;
+
+            if (idToProcess == null) continue;
+
+            // ✅ STRONGER DUPLICATE CHECK
+            if (_processedMessageIds.contains(idToProcess)) {
+              duplicateCount++;
+              continue;
+            }
+
+            final existingMessage = _messageBox.values.firstWhereOrNull(
+                  (existingMsg) =>
+              existingMsg.messageId == idToProcess ||
+                  (existingMsg.messageContent == msg["message_text"]?.toString() &&
+                      existingMsg.timestamp.difference(
+                          DateTime.tryParse(msg["timestamp"]?.toString() ?? "") ?? DateTime.now()
+                      ).inSeconds.abs() < 5),
+            );
+
+            if (existingMessage == null) {
+              _processedMessageIds.add(idToProcess);
               await _handleIncomingData(msg);
+              newMessagesCount++;
+            } else {
+              duplicateCount++;
+              print("⚠️ Duplicate message from server: $idToProcess");
             }
           }
-          print("✅ Messages loaded for chatId=${widget.chatId}: ${data["messages"].length}");
+
+          print("✅ Loaded $newMessagesCount new messages, skipped $duplicateCount duplicates for chatId=${widget.chatId}");
           if (mounted) setState(() {});
         }
+      } else {
+        print("❌ Server error: ${res.statusCode}");
       }
+
+      setState(() {
+        _areMessagesLoaded = true;
+      });
+
     } catch (e) {
       print("❌ Fetch messages error: $e");
+      setState(() {
+        _areMessagesLoaded = true;
+      });
     }
   }
 
@@ -345,7 +436,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
 
       final existingMessage = _messageBox.values.firstWhereOrNull(
-            (msg) => msg.messageId == idToProcess,
+            (msg) => msg.messageId == idToProcess && msg.chatId == widget.chatId,
       );
 
       if (existingMessage != null) {
@@ -413,7 +504,43 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _typingTimer?.cancel();
   }
 
-  // 🔥 FIXED: FAST MEDIA MESSAGE SENDING
+  void _openImageFullScreen(Message message) {
+    final bool isLocalFile = message.messageId.toString().startsWith('temp_') ||
+        (message.messageContent.startsWith('/') && File(message.messageContent).existsSync());
+
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => MediaViewerScreen(
+          mediaUrl: message.messageContent,
+          messageId: message.messageId,
+          isLocalFile: isLocalFile,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickImage() async {
+    try {
+      final XFile? pickedFile = await _imagePicker.pickImage(
+        source: ImageSource.gallery,
+        imageQuality: _imageQuality,
+        maxWidth: _maxImageWidth,
+        maxHeight: _maxImageHeight,
+      );
+
+      if (pickedFile != null) {
+        setState(() {
+          _imageFile = File(pickedFile.path);
+          _focusNode.unfocus();
+        });
+
+        _sendMessage();
+      }
+    } catch (e) {
+      print("Error picking image: $e");
+    }
+  }
+
   Future<void> _sendMessage() async {
     if (_isSending) {
       return;
@@ -431,13 +558,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     try {
       if (_imageFile != null) {
-        // ✅ INSTANT MEDIA SENDING
-        print("🚀 Sending media instantly...");
+        print("🚀 Sending high quality media...");
 
-        // Force scroll immediately
         _jumpToBottom();
 
-        // Send media in background
         ChatService.sendMediaMessage(
           chatId: widget.chatId,
           receiverId: widget.otherUserId,
@@ -450,7 +574,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
         setState(() => _imageFile = null);
       } else {
-        // Text message
         await ChatService.sendMessage(
           chatId: widget.chatId,
           receiverId: widget.otherUserId,
@@ -482,27 +605,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _pickImage() async {
-    try {
-      final XFile? pickedFile = await _imagePicker.pickImage(
-        source: ImageSource.gallery,
-        imageQuality: 70,
-      );
-
-      if (pickedFile != null) {
-        setState(() {
-          _imageFile = File(pickedFile.path);
-          _focusNode.unfocus();
-        });
-
-        // Auto-send after picking image
-        _sendMessage();
-      }
-    } catch (e) {
-      print("Error picking image: $e");
-    }
-  }
-
   Future<void> _forwardMessages() async {
     if (selectedMessageIds.isEmpty) return;
 
@@ -514,7 +616,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
 
     if (targetChatId != null && targetChatId is int) {
-      // ✅ FIX: Convert string IDs to int for forwarding
       final messageIdsForForwarding = selectedMessageIds
           .map((id) => int.tryParse(id) ?? 0)
           .where((id) => id != 0)
@@ -581,7 +682,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ✅ MEDIA LOADING WIDGET
   Widget _buildMediaLoading() {
     return Container(
       color: Colors.grey[200],
@@ -598,7 +698,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // ✅ MEDIA ERROR WIDGET
   Widget _buildMediaError(String url, String error) {
     return Container(
       color: Colors.grey[300],
@@ -618,24 +717,41 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // ✅ LOCAL MEDIA PREVIEW
-  Widget _buildLocalMediaPreview(String localPath) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(8),
+  // ✅ WHATSAPP-STYLE LOCAL MEDIA PREVIEW with time and ticks inside
+  Widget _buildLocalMediaPreview(String localPath, Message msg, bool isMe) {
+    return GestureDetector(
+      onTap: () {
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (context) => MediaViewerScreen(
+              mediaUrl: localPath,
+              messageId: 'local_preview',
+              isLocalFile: true,
+            ),
+          ),
+        );
+      },
       child: Container(
-        width: 200,
-        height: 200,
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.65,
+          maxHeight: 300,
+        ),
         child: Stack(
           children: [
-            Image.file(
-              File(localPath),
-              fit: BoxFit.cover,
-              width: 200,
-              height: 200,
-              errorBuilder: (context, error, stackTrace) {
-                return _buildMediaError(localPath, error.toString());
-              },
+            // Image
+            ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: Image.file(
+                File(localPath),
+                fit: BoxFit.cover,
+                width: double.infinity,
+                height: double.infinity,
+                errorBuilder: (context, error, stackTrace) {
+                  return _buildMediaError(localPath, error.toString());
+                },
+              ),
             ),
+
             // ✅ UPLOADING INDICATOR
             Container(
               color: Colors.black54,
@@ -655,14 +771,51 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 ),
               ),
             ),
+
+            // ✅ TIME AND TICKS OVERLAY (WhatsApp-like)
+            Positioned(
+              bottom: 6,
+              right: 6,
+              child: Container(
+                padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      _formatTime(msg.timestamp),
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w400,
+                      ),
+                    ),
+                    if (isMe) SizedBox(width: 4),
+                    if (isMe)
+                      Icon(
+                        Icons.access_time,
+                        size: 12,
+                        color: Colors.grey[300],
+                      ),
+                  ],
+                ),
+              ),
+            ),
           ],
         ),
       ),
     );
   }
 
+  // ✅ WHATSAPP-STYLE MEDIA MESSAGE with time and ticks inside image
   Widget _buildMediaMessage(Message msg, String mediaUrl, Color textColor) {
     print("📸 Building media message - URL: $mediaUrl | Type: ${msg.messageType}");
+
+    final userId = LocalAuthService.getUserId();
+    final bool isMe = msg.senderId == userId;
 
     // ✅ LOCAL FILE CHECK (Temporary media)
     if (mediaUrl.startsWith('/') ||
@@ -670,7 +823,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         mediaUrl.contains('temp_') ||
         (File(mediaUrl).existsSync() && !mediaUrl.startsWith('http'))) {
 
-      return _buildLocalMediaPreview(mediaUrl);
+      return _buildLocalMediaPreview(mediaUrl, msg, isMe);
     }
 
     // ✅ SERVER MEDIA URL CHECK
@@ -681,8 +834,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         !mediaUrl.startsWith('http')) {
 
       return Container(
-        width: 200,
-        height: 200,
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.65,
+          maxHeight: 200,
+        ),
         padding: EdgeInsets.all(12),
         decoration: BoxDecoration(
           color: Colors.grey[300],
@@ -702,25 +857,158 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       );
     }
 
-    // ✅ SERVER MEDIA - Use CachedNetworkImage
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(8),
+    // ✅ SERVER MEDIA - WhatsApp-like with time and ticks
+    return GestureDetector(
+      onTap: () => _openImageFullScreen(msg),
       child: Container(
-        width: 200,
-        height: 200,
-        child: CachedNetworkImage(
-          imageUrl: mediaUrl,
-          placeholder: (context, url) => _buildMediaLoading(),
-          errorWidget: (context, url, error) => _buildMediaError(url, error.toString()),
-          fit: BoxFit.cover,
-          width: 200,
-          height: 200,
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.65,
+          maxHeight: 300,
+        ),
+        child: Stack(
+          children: [
+            // Image
+            ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: CachedNetworkImage(
+                imageUrl: mediaUrl,
+                placeholder: (context, url) => _buildMediaLoading(),
+                errorWidget: (context, url, error) => _buildMediaError(url, error.toString()),
+                fit: BoxFit.cover,
+                width: double.infinity,
+                height: double.infinity,
+              ),
+            ),
+
+            // ✅ TIME AND TICKS OVERLAY (WhatsApp-like)
+            Positioned(
+              bottom: 6,
+              right: 6,
+              child: Container(
+                padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      _formatTime(msg.timestamp),
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w400,
+                      ),
+                    ),
+                    if (isMe) SizedBox(width: 4),
+                    if (isMe)
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (msg.isRead == 1)
+                            Icon(
+                              Icons.done_all,
+                              size: 12,
+                              color: Colors.blue,
+                            )
+                          else if (msg.isDelivered == 1)
+                            Icon(
+                              Icons.done_all,
+                              size: 12,
+                              color: Colors.grey[300],
+                            )
+                          else
+                            Icon(
+                              Icons.done,
+                              size: 12,
+                              color: Colors.grey[300],
+                            ),
+                        ],
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ],
         ),
       ),
     );
   }
 
-  // 🔥 FIXED: _buildMessageBubble function
+  // ✅ UPDATED MEDIA MESSAGE BUBBLE - Remove extra time section
+  Widget _buildMediaMessageBubble(Message msg, {required bool isMe, required bool isSelected}) {
+    final color = isMe ? const Color(0xFFDCF8C6) : Colors.white;
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () {
+        if (selectedMessageIds.isNotEmpty) {
+          setState(() {
+            selectedMessageIds.clear();
+          });
+        } else if (_focusNode.hasFocus) {
+          _focusNode.unfocus();
+        } else {
+          _openImageFullScreen(msg);
+        }
+      },
+      onLongPress: () {
+        setState(() {
+          final msgId = msg.messageId.toString();
+          if (selectedMessageIds.contains(msgId)) {
+            selectedMessageIds.remove(msgId);
+          } else {
+            selectedMessageIds.clear();
+            selectedMessageIds.add(msgId);
+          }
+        });
+      },
+      child: Container(
+        decoration: BoxDecoration(
+          border: isSelected ? Border.all(color: Colors.lightGreen, width: 2) : null,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Align(
+          alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+          child: Container(
+            margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+            padding: const EdgeInsets.all(6),
+            constraints: BoxConstraints(
+              maxWidth: MediaQuery.of(context).size.width * 0.75,
+            ),
+            decoration: BoxDecoration(
+              color: color,
+              borderRadius: BorderRadius.only(
+                topLeft: isMe ? const Radius.circular(16) : const Radius.circular(2),
+                topRight: isMe ? const Radius.circular(2) : const Radius.circular(16),
+                bottomLeft: const Radius.circular(16),
+                bottomRight: const Radius.circular(16),
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.grey.withOpacity(0.1),
+                  spreadRadius: 1,
+                  blurRadius: 2,
+                  offset: const Offset(0, 1),
+                ),
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // ✅ Media with time and ticks inside image
+                _buildMediaMessage(msg, msg.messageContent, Colors.black),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ✅ UPDATED TEXT MESSAGE BUBBLE - Keep original for text messages
   Widget _buildMessageBubble(Message msg, {Key? key}) {
     final String msgId = msg.messageId.toString();
     final bool isSelected = selectedMessageIds.contains(msgId);
@@ -728,16 +1016,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final userId = LocalAuthService.getUserId();
     final bool isMe = msg.senderId == userId;
 
-    // ✅ FIX: Temporary media messages ko show karo (both uploading and final)
     if (msg.messageId.toString().startsWith('temp_') && msg.messageType == 'media') {
-      // Show the media message with proper content using new method
       return _buildMediaMessageBubble(msg, isMe: isMe, isSelected: isSelected);
     }
-
-    // ❌ REMOVE THIS BLOCK - Temporary non-media messages ko hide karo
-    // if (msg.messageId.toString().startsWith('temp_') && msg.messageType != 'media') {
-    //   return const SizedBox.shrink();
-    // }
 
     if ((isMe && msg.isDeletedSender == 1) || (!isMe && msg.isDeletedReceiver == 1)) {
       return const SizedBox.shrink();
@@ -749,6 +1030,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final bool contentDeleted = !isMe && msg.isDeletedSender == 1;
     final String content = contentDeleted ? '❌ This message was deleted' : msg.messageContent;
     final messageType = msg.messageType;
+
+    final bool isMediaMessage = (messageType == 'media' || messageType == 'encrypted_media') && !contentDeleted;
 
     final borderRadius = BorderRadius.only(
       topLeft: isMe ? const Radius.circular(16) : const Radius.circular(2),
@@ -766,6 +1049,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           });
         } else if (_focusNode.hasFocus) {
           _focusNode.unfocus();
+        } else if (isMediaMessage) {
+          _openImageFullScreen(msg);
         }
       },
       onLongPress: () {
@@ -791,7 +1076,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             padding: messageType == 'text' || contentDeleted
                 ? const EdgeInsets.symmetric(horizontal: 10, vertical: 8)
                 : const EdgeInsets.all(6),
-            constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+            constraints: BoxConstraints(
+              maxWidth: MediaQuery.of(context).size.width * 0.75,
+            ),
             decoration: BoxDecoration(
               color: color,
               borderRadius: borderRadius,
@@ -818,126 +1105,44 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   else
                     Text("Unsupported message type", style: TextStyle(color: textColor, fontSize: 16)),
 
-                const SizedBox(height: 4),
-
-                // Time and Status
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      _formatTime(msg.timestamp),
-                      style: const TextStyle(color: Colors.black54, fontSize: 12),
-                    ),
-                    if (isMe) const SizedBox(width: 4),
-                    if (isMe)
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (msg.isRead == 1)
-                            const Icon(
-                              Icons.done_all,
-                              size: 16,
-                              color: Colors.blue,
-                            )
-                          else if (msg.isDelivered == 1)
-                            const Icon(
-                              Icons.done_all,
-                              size: 16,
-                              color: Colors.black54,
-                            )
-                          else
-                            const Icon(
-                              Icons.done,
-                              size: 16,
-                              color: Colors.black54,
-                            ),
-                        ],
+                // ✅ FOR TEXT MESSAGES ONLY - Show time and ticks below
+                if (messageType == 'text' && !contentDeleted) ...[
+                  const SizedBox(height: 4),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        _formatTime(msg.timestamp),
+                        style: const TextStyle(color: Colors.black54, fontSize: 12),
                       ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  // ✅ ✅ ✅ YAHAN ADD KARO - _buildMessageBubble ke baad immediately
-  Widget _buildMediaMessageBubble(Message msg, {required bool isMe, required bool isSelected}) {
-    final color = isMe ? const Color(0xFFDCF8C6) : Colors.white;
-
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () {
-        if (selectedMessageIds.isNotEmpty) {
-          setState(() {
-            selectedMessageIds.clear();
-          });
-        } else if (_focusNode.hasFocus) {
-          _focusNode.unfocus();
-        }
-      },
-      child: Container(
-        decoration: BoxDecoration(
-          border: isSelected ? Border.all(color: Colors.lightGreen, width: 2) : null,
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Align(
-          alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-          child: Container(
-            margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-            padding: const EdgeInsets.all(6),
-            constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
-            decoration: BoxDecoration(
-              color: color,
-              borderRadius: BorderRadius.only(
-                topLeft: isMe ? const Radius.circular(16) : const Radius.circular(2),
-                topRight: isMe ? const Radius.circular(2) : const Radius.circular(16),
-                bottomLeft: const Radius.circular(16),
-                bottomRight: const Radius.circular(16),
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.grey.withOpacity(0.1),
-                  spreadRadius: 1,
-                  blurRadius: 2,
-                  offset: const Offset(0, 1),
-                ),
-              ],
-            ),
-            child: Column(
-              crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Media Content
-                _buildMediaMessage(msg, msg.messageContent, Colors.black),
-
-                const SizedBox(height: 4),
-
-                // Time and Status
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      _formatTime(msg.timestamp),
-                      style: const TextStyle(color: Colors.black54, fontSize: 12),
-                    ),
-                    if (isMe) const SizedBox(width: 4),
-                    if (isMe)
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (msg.isRead == 1)
-                            const Icon(Icons.done_all, size: 16, color: Colors.blue)
-                          else if (msg.isDelivered == 1)
-                            const Icon(Icons.done_all, size: 16, color: Colors.black54)
-                          else
-                            const Icon(Icons.done, size: 16, color: Colors.black54),
-                        ],
-                      ),
-                  ],
-                ),
+                      if (isMe) const SizedBox(width: 4),
+                      if (isMe)
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (msg.isRead == 1)
+                              const Icon(
+                                Icons.done_all,
+                                size: 16,
+                                color: Colors.blue,
+                              )
+                            else if (msg.isDelivered == 1)
+                              const Icon(
+                                Icons.done_all,
+                                size: 16,
+                                color: Colors.black54,
+                              )
+                            else
+                              const Icon(
+                                Icons.done,
+                                size: 16,
+                                color: Colors.black54,
+                              ),
+                          ],
+                        ),
+                    ],
+                  ),
+                ],
               ],
             ),
           ),
@@ -1134,7 +1339,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           if (_focusNode.hasFocus) {
             _focusNode.unfocus();
           }
-          // ✅ Body pe tap karte hi selection clear ho
           if (selectedMessageIds.isNotEmpty) {
             setState(() {
               selectedMessageIds.clear();
@@ -1158,7 +1362,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   builder: (context, box, child) {
                     final messages = box.values
                         .where((msg) => msg.chatId == widget.chatId)
-                    // ✅ TEMPORARY MEDIA MESSAGES KO ALLOW KARO
                         .where((msg) => !msg.messageId.toString().startsWith('temp_') ||
                         (msg.messageId.toString().startsWith('temp_') && msg.messageType == 'media'))
                         .toList();

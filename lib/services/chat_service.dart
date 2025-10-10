@@ -66,16 +66,40 @@ class ChatService {
   static final Set<String> _processedMessageIds = {};
   static final Set<String> _uploadingMediaIds = {};
 
+  // ✅ ADD: Track connected state to prevent multiple connections
+  static bool _isConnecting = false;
+  static DateTime? _lastSocketInitTime;
+
   static Future<void> init() async {
     _chatBox = Hive.box<Chat>('chatList');
     await _cryptoManager.init();
     _isInitialized = true;
     print("✅ Initialized ChatService");
-    initSocket();
+
+    // ✅ DELAYED socket initialization to prevent race conditions
+    Future.delayed(const Duration(milliseconds: 500), () {
+      initSocket();
+    });
   }
 
   static void initSocket() {
-    if (_socket != null && _socket!.connected) return;
+    // ✅ STRONG CHECK: Prevent multiple socket initializations
+    if (_isConnecting) {
+      print("⚠️ Socket connection already in progress, skipping...");
+      return;
+    }
+
+    // ✅ PREVENT RAPID RE-INITIALIZATION (min 5 seconds between attempts)
+    if (_lastSocketInitTime != null &&
+        DateTime.now().difference(_lastSocketInitTime!).inSeconds < 5) {
+      print("⚠️ Too soon for socket re-initialization, skipping...");
+      return;
+    }
+
+    if (_socket != null && _socket!.connected) {
+      print("✅ Socket already connected, skipping re-initialization");
+      return;
+    }
 
     final userId = _authBox.get('userId');
     if (userId == null) {
@@ -83,157 +107,313 @@ class ChatService {
       return;
     }
 
+    _isConnecting = true;
+    _lastSocketInitTime = DateTime.now();
+
     try {
+      print("🔄 Creating fresh socket connection...");
+
+      // ✅ CLEAN UP OLD SOCKET COMPLETELY
+      if (_socket != null) {
+        _cleanupSocketListeners();
+        _socket!.disconnect();
+        _socket!.destroy();
+        _socket = null;
+      }
+
       _socket = IO.io(
         socketBase,
         IO.OptionBuilder()
             .setTransports(['websocket', 'polling'])
             .enableAutoConnect()
             .enableReconnection()
-            .setReconnectionAttempts(9999)
-            .setReconnectionDelay(2000)
-            .setTimeout(5000)
+            .setReconnectionAttempts(3) // ✅ REDUCE from 9999 to prevent spam
+            .setReconnectionDelay(3000) // ✅ INCREASE delay
+            .setTimeout(10000) // ✅ INCREASE timeout
             .build(),
       );
 
+      // ✅ SETUP CONNECTION LISTENERS FIRST
       _socket!.onConnect((_) {
-        print("✅ Connected to socket server");
+        _isConnecting = false;
+        print("✅ Fresh socket connection established");
         _socket!.emit("register", userId);
         print("👤 Emitted 'register' for user $userId");
 
-        _socket!.on("ping", (_) {
-          print("❤️ Received 'ping', sending 'pong'");
-          _socket!.emit("pong");
-        });
+        // ✅ SETUP HEARTBEAT
+        _setupHeartbeat();
 
-        _pingTimer?.cancel();
-        _pingTimer = Timer.periodic(const Duration(seconds: 25), (timer) {
-          if (_socket != null && _socket!.connected) {
-            _socket!.emit("pong");
-            print("❤️ Proactively sending 'pong' heartbeat.");
-          } else {
-            _pingTimer?.cancel();
-          }
-        });
+        // ✅ JOIN CHAT ROOMS
+        _joinChatRooms();
 
-        final chatIds = _messageBox.values.map((m) => m.chatId).toSet();
-        for (final id in chatIds) {
-          _socket!.emit("join_chat", id);
-        }
+        // ✅ SETUP MESSAGE LISTENERS AFTER CONNECTION
+        _setupMessageListeners();
+
+        print("✅ Socket setup completed successfully");
       });
 
       _socket!.onDisconnect((reason) {
-        print("❌ Disconnected: $reason");
-        _pingTimer?.cancel();
-        _statusUpdateTimer?.cancel();
+        _isConnecting = false;
+        print("❌ Socket disconnected: $reason");
+        _cleanupTimers();
       });
 
-      _socket!.onConnectError((err) => print("❌ Connect error: $err"));
-      _socket!.onError((err) => print("❌ Socket error: $err"));
+      _socket!.onConnectError((err) {
+        _isConnecting = false;
+        print("❌ Socket connect error: $err");
+        _cleanupTimers();
+      });
 
-      _socket!.on("new_message", (data) async {
-        print("📨 New message received: ${jsonEncode(data)}");
+      _socket!.onError((err) {
+        print("❌ Socket general error: $err");
+      });
+
+      // ✅ CONNECT SOCKET
+      _socket!.connect();
+
+    } catch (e) {
+      _isConnecting = false;
+      print("❌ Socket init error: $e");
+      _cleanupTimers();
+    }
+  }
+
+  // ✅ SEPARATE FUNCTION TO CLEANUP OLD LISTENERS
+  static void _cleanupSocketListeners() {
+    if (_socket != null) {
+      _socket!.off("connect");
+      _socket!.off("disconnect");
+      _socket!.off("connect_error");
+      _socket!.off("error");
+      _socket!.off("ping");
+      _socket!.off("new_message");
+      _socket!.off("receive_message");
+      _socket!.off("message_delivered");
+      _socket!.off("mark_delivered_bulk");
+      _socket!.off("message_read");
+      _socket!.off("user_typing");
+      _socket!.off("user_status");
+      _socket!.off("media_upload_progress");
+      _socket!.off("media_message_ready");
+    }
+    print("✅ Cleaned up old socket listeners");
+  }
+
+  // ✅ SEPARATE FUNCTION FOR HEARTBEAT
+  static void _setupHeartbeat() {
+    // Clean up old timers
+    _pingTimer?.cancel();
+    _statusUpdateTimer?.cancel();
+
+    // Setup ping-pong heartbeat
+    _socket!.on("ping", (_) {
+      print("❤️ Received 'ping', sending 'pong'");
+      _socket!.emit("pong");
+    });
+
+    _pingTimer = Timer.periodic(const Duration(seconds: 25), (timer) {
+      if (_socket != null && _socket!.connected) {
+        _socket!.emit("pong");
+        print("❤️ Proactively sending 'pong' heartbeat");
+      } else {
+        _pingTimer?.cancel();
+      }
+    });
+
+    // Setup status update heartbeat
+    final userId = _authBox.get('userId');
+    _statusUpdateTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
+      if (_socket != null && _socket!.connected && userId != null) {
+        _socket!.emit("user_status", {"userId": userId, "status": "online"});
+        print("🌐 Sending online status heartbeat");
+      } else {
+        _statusUpdateTimer?.cancel();
+      }
+    });
+  }
+
+  // ✅ SEPARATE FUNCTION FOR JOINING CHAT ROOMS
+  static void _joinChatRooms() {
+    final chatIds = _messageBox.values.map((m) => m.chatId).toSet();
+    for (final id in chatIds) {
+      _socket!.emit("join_chat", id);
+      print("✅ Joined chat room: $id");
+    }
+    print("✅ Joined ${chatIds.length} chat rooms");
+  }
+
+  // ✅ SEPARATE FUNCTION FOR MESSAGE LISTENERS
+  static void _setupMessageListeners() {
+    // ✅ NEW MESSAGE LISTENER with STRONG duplicate protection
+    _socket!.on("new_message", (data) async {
+      print("📨 [new_message] event received");
+      try {
+        final messageId = data["message_id"]?.toString();
+        final tempId = data["temp_id"]?.toString();
+        final idToProcess = messageId ?? tempId;
+
+        if (idToProcess == null) {
+          print("❌ [new_message] No valid message ID");
+          return;
+        }
+
+        // ✅ STRONG DUPLICATE CHECK
+        if (_processedMessageIds.contains(idToProcess)) {
+          print("⚠️ [new_message] Duplicate blocked: $idToProcess");
+          return;
+        }
+
         await _handleIncomingData(data, source: "new_message");
         SoundUtils.playReceiveSound();
-      });
+      } catch (e) {
+        print("❌ [new_message] Error: $e");
+      }
+    });
 
-      _socket!.on("receive_message", (data) async {
-        print("📨 Receive message received: ${jsonEncode(data)}");
-        await _handleIncomingData(
-          data,
-          source: "receive_message",
-          forceDelivered: true,
-        );
-      });
-
-      _socket!.on("message_delivered", (data) async {
+    // ✅ RECEIVE MESSAGE LISTENER with STRONG duplicate protection
+    _socket!.on("receive_message", (data) async {
+      print("📨 [receive_message] event received");
+      try {
         final messageId = data["message_id"]?.toString();
-        if (messageId != null) {
-          await updateDeliveryStatus(messageId, 1);
-          print("✅ Client received delivery confirmation for message: $messageId");
-          SoundUtils.playDeliveredSound();
-        }
-      });
-
-      _socket!.on("mark_delivered_bulk", (data) async {
-        final ids = data["message_ids"] as List<dynamic>? ?? [];
-        for (var id in ids) {
-          final msg = _messageBox.get(id as int) as Message?;
-          if (msg != null && msg.isDelivered == 0) {
-            msg.isDelivered = 1;
-            await _messageBox.put(msg.messageId, msg);
-            _newMessageController.add(msg);
-          }
-        }
-        print("✅ Sender side: Bulk delivered messages updated");
-      });
-
-      _socket!.on("message_read", (data) async {
-        try {
-          List<dynamic> messageIds = [];
-          if (data["message_ids"] != null) {
-            messageIds = data["message_ids"];
-          } else if (data["message_id"] != null) {
-            messageIds = [data["message_id"]];
-          }
-
-          if (messageIds.isEmpty) return;
-
-          for (var id in messageIds) {
-            final messageId = id.toString();
-            await markMessageReadLocal(messageId);
-            print("✅ Message marked as read (from server): $messageId");
-          }
-
-          print("📦 All received messages marked as read: ${messageIds.join(", ")}");
-          SoundUtils.playReadSound();
-        } catch (e) {
-          print("❌ message_read parse error: $e");
-        }
-      });
-
-      _socket!.on("user_typing", (data) {
-        print("✍️ User typing: $data");
-        _typingStatusController.sink.add({
-          "chatId": data["chat_id"],
-          "userId": data["user_id"],
-          "isTyping": data["isTyping"]
-        });
-      });
-
-      _socket!.on("user_status", (data) {
-        print("🌐 User status updated: $data");
-        _userStatusController.sink.add({
-          "userId": data["userId"]?.toString(),
-          "status": data["status"]?.toString()
-        });
-      });
-
-      _socket!.on("media_upload_progress", (data) {
         final tempId = data["temp_id"]?.toString();
-        final progress = data["progress"]?.toDouble();
-        if (tempId != null && progress != null) {
-          _uploadProgressController.sink.add({
-            "tempId": tempId,
-            "progress": progress,
-          });
+        final idToProcess = messageId ?? tempId;
+
+        if (idToProcess == null) {
+          print("❌ [receive_message] No valid message ID");
+          return;
         }
-      });
 
-      // ✅ ✅ ✅ YAHAN ADD KARO - media_upload_progress ke baad
-      _socket!.on("media_message_ready", (data) async {
-        print("📨 MEDIA MESSAGE READY RECEIVED:");
-        print("   Data: ${jsonEncode(data)}");
+        // ✅ STRONG DUPLICATE CHECK
+        if (_processedMessageIds.contains(idToProcess)) {
+          print("⚠️ [receive_message] Duplicate blocked: $idToProcess");
+          return;
+        }
 
-        // ✅ Handle instant media message delivery
+        await _handleIncomingData(data, source: "receive_message", forceDelivered: true);
+      } catch (e) {
+        print("❌ [receive_message] Error: $e");
+      }
+    });
+
+    // ✅ MEDIA MESSAGE READY LISTENER with STRONG duplicate protection
+    _socket!.on("media_message_ready", (data) async {
+      print("📨 [media_message_ready] event received");
+      try {
+        final messageId = data["message_id"]?.toString();
+        final tempId = data["temp_id"]?.toString();
+        final idToProcess = messageId ?? tempId;
+
+        if (idToProcess == null) {
+          print("❌ [media_message_ready] No valid message ID");
+          return;
+        }
+
+        // ✅ STRONG DUPLICATE CHECK
+        if (_processedMessageIds.contains(idToProcess)) {
+          print("⚠️ [media_message_ready] Duplicate blocked: $idToProcess");
+          return;
+        }
+
         await _handleIncomingData(data, source: "media_message_ready", forceDelivered: true);
+      } catch (e) {
+        print("❌ [media_message_ready] Error: $e");
+      }
+    });
+
+    // ✅ MESSAGE DELIVERED LISTENER
+    _socket!.on("message_delivered", (data) async {
+      final messageId = data["message_id"]?.toString();
+      if (messageId != null) {
+        await updateDeliveryStatus(messageId, 1);
+        print("✅ [message_delivered] Delivery confirmed: $messageId");
+        SoundUtils.playDeliveredSound();
+      }
+    });
+
+    // ✅ BULK MESSAGE DELIVERED LISTENER
+    _socket!.on("mark_delivered_bulk", (data) async {
+      final ids = data["message_ids"] as List<dynamic>? ?? [];
+      int updatedCount = 0;
+
+      for (var id in ids) {
+        final msg = _messageBox.get(id.toString()) as Message?;
+        if (msg != null && msg.isDelivered == 0) {
+          msg.isDelivered = 1;
+          await _messageBox.put(msg.messageId, msg);
+          _newMessageController.add(msg);
+          updatedCount++;
+        }
+      }
+      print("✅ [mark_delivered_bulk] Updated $updatedCount messages");
+    });
+
+    // ✅ MESSAGE READ LISTENER
+    _socket!.on("message_read", (data) async {
+      try {
+        List<dynamic> messageIds = [];
+        if (data["message_ids"] != null) {
+          messageIds = data["message_ids"];
+        } else if (data["message_id"] != null) {
+          messageIds = [data["message_id"]];
+        }
+
+        if (messageIds.isEmpty) return;
+
+        int readCount = 0;
+        for (var id in messageIds) {
+          final messageId = id.toString();
+          await markMessageReadLocal(messageId);
+          readCount++;
+        }
+
+        print("✅ [message_read] Marked $readCount messages as read");
+        SoundUtils.playReadSound();
+      } catch (e) {
+        print("❌ [message_read] Error: $e");
+      }
+    });
+
+    // ✅ USER TYPING LISTENER
+    _socket!.on("user_typing", (data) {
+      print("✍️ [user_typing] event received");
+      _typingStatusController.sink.add({
+        "chatId": data["chat_id"],
+        "userId": data["user_id"],
+        "isTyping": data["isTyping"] ?? false
       });
+    });
 
+    // ✅ USER STATUS LISTENER
+    _socket!.on("user_status", (data) {
+      print("🌐 [user_status] event received");
+      _userStatusController.sink.add({
+        "userId": data["userId"]?.toString(),
+        "status": data["status"]?.toString() ?? "offline"
+      });
+    });
 
-      _socket!.connect();
-    } catch (e) {
-      print("❌ Socket init error: $e");
-    }
+    // ✅ MEDIA UPLOAD PROGRESS LISTENER
+    _socket!.on("media_upload_progress", (data) {
+      final tempId = data["temp_id"]?.toString();
+      final progress = data["progress"]?.toDouble();
+      if (tempId != null && progress != null) {
+        _uploadProgressController.sink.add({
+          "tempId": tempId,
+          "progress": progress,
+        });
+      }
+    });
+
+    print("✅ All socket listeners setup completed");
+  }
+
+  // ✅ CLEANUP TIMERS FUNCTION
+  static void _cleanupTimers() {
+    _pingTimer?.cancel();
+    _pingTimer = null;
+    _statusUpdateTimer?.cancel();
+    _statusUpdateTimer = null;
+    print("✅ Cleaned up socket timers");
   }
 
   static bool get isConnected => _socket?.connected ?? false;
@@ -247,85 +427,101 @@ class ChatService {
       });
     }
 
-    _pingTimer?.cancel();
-    _pingTimer = null;
-    _statusUpdateTimer?.cancel();
-    _statusUpdateTimer = null;
+    _cleanupTimers();
+    _cleanupSocketListeners();
+
     _socket?.disconnect();
+    _socket?.destroy();
     _socket = null;
     _isInitialized = false;
-    _typingStatusController.close();
-    _userStatusController.close();
-    _messageDeliveredController.close();
-    _messageSentController.close();
-    _uploadProgressController.close();
-    print("🔌 Socket disposed");
+    _isConnecting = false;
+
+    // ✅ CLEAR PROCESSED MESSAGE IDs
+    _processedMessageIds.clear();
+    _uploadingMediaIds.clear();
+
+    print("🔌 Socket completely disposed");
   }
 
   // ------------------- HANDLE INCOMING DATA - COMPLETELY FIXED -------------------
   static Future<void> _handleIncomingData(dynamic data,
       {String source = "", bool forceDelivered = false}) async {
+    String? idToProcess;
+
     try {
       final currentUserId = _authBox.get('userId');
-      if (currentUserId == null) return;
+      if (currentUserId == null) {
+        print("❌ User ID not found in authBox");
+        return;
+      }
 
       final messageId = data["message_id"]?.toString();
       final tempId = data["temp_id"]?.toString();
-      final idToProcess = messageId ?? tempId;
+      idToProcess = messageId ?? tempId;
 
       if (idToProcess == null) {
         print("❌ Incoming data has no valid message_id or temp_id. Ignoring.");
         return;
       }
 
+      print("📥 Processing message from $source: $idToProcess");
+
+      // ✅ STRONG DUPLICATE PROTECTION - Multiple layers
       if (_processedMessageIds.contains(idToProcess)) {
-        print("⚠️ Ignoring duplicate message processing for ID: $idToProcess");
+        print("⚠️ Message already being processed: $idToProcess");
         return;
       }
       _processedMessageIds.add(idToProcess);
-      Future.delayed(const Duration(seconds: 5), () {
-        _processedMessageIds.remove(idToProcess);
+
+      // Auto-clean after 10 seconds
+      Future.delayed(const Duration(seconds: 10), () {
+        _processedMessageIds.remove(idToProcess!);
       });
 
-      // ✅ FIX: Handle tempId to messageId conversion FIRST
+      // ✅ STEP 1: Handle tempId to messageId conversion FIRST
       if (tempId != null && messageId != null) {
         await updateMessageId(tempId, messageId, forceDelivered ? 1 : 0);
         print("✅ TempId converted: $tempId -> $messageId");
 
-        // After conversion, use the new messageId for further processing
-        final existingMessage = _messageBox.values.firstWhereOrNull(
+        // After conversion, check if message already exists with new ID
+        final existingWithNewId = _messageBox.values.firstWhereOrNull(
               (msg) => msg.messageId == messageId,
         );
 
-        if (existingMessage != null) {
+        if (existingWithNewId != null) {
           print("⚠️ Message already exists with new ID: $messageId");
           return;
         }
       }
 
-      // Check if message exists (using the final ID)
-      final existingMessage = _messageBox.values.firstWhereOrNull(
+      // ✅ STEP 2: STRONG DUPLICATE CHECK - Check by ID
+      final existingById = _messageBox.values.firstWhereOrNull(
             (msg) => msg.messageId == idToProcess,
       );
 
-      if (existingMessage != null) {
-        print("⚠️ Message exists: $idToProcess");
+      if (existingById != null) {
+        print("⚠️ Message already exists in database: $idToProcess");
         return;
       }
 
-      // Process message content
-      String messageContent = data["message_text"] ?? "";
-      String mediaUrl = data["media_url"]?.toString() ?? "";
-      String messageType = data["message_type"]?.toString() ?? "text";
+      // ✅ STEP 3: Process message content
+      final messageContent = data["message_text"]?.toString() ?? "";
+      final mediaUrl = data["media_url"]?.toString() ?? "";
+      final messageType = data["message_type"]?.toString() ?? "text";
+      final messageTimestamp = DateTime.tryParse(data["timestamp"]?.toString() ?? "") ?? DateTime.now();
+      final chatId = int.tryParse(data["chat_id"]?.toString() ?? "0") ?? 0;
+      final senderId = int.tryParse(data["sender_id"]?.toString() ?? "0") ?? 0;
+
       String finalContent = messageContent;
       String finalMessageType = messageType;
 
-      print("📥 Processing message from $source:");
+      print("🔄 Processing content:");
       print("   Type: $messageType");
       print("   Media URL: $mediaUrl");
       print("   Temp ID: $tempId");
       print("   Message ID: $messageId");
 
+      // ✅ STEP 4: Handle different message types
       if (messageType == "encrypted") {
         try {
           // ✅ FIRST: Check if this is actually a media message disguised as encrypted
@@ -335,8 +531,7 @@ class ChatService {
             finalContent = '${Config.baseNodeApiUrl}/media/file/$fileName';
             finalMessageType = "media";
             print("✅ Converted to media message: $finalContent");
-          }
-          else {
+          } else {
             // Try actual decryption for text messages
             final decryptedData = await _cryptoManager.decryptAndDecompress(messageContent);
             final decodedData = jsonDecode(decryptedData['content']);
@@ -351,12 +546,13 @@ class ChatService {
             final fileName = mediaUrl.split('/').last;
             finalContent = '${Config.baseNodeApiUrl}/media/file/$fileName';
             finalMessageType = "media";
+            print("🔄 Fallback to media message: $finalContent");
           } else {
             finalContent = "[Decryption Failed]";
+            finalMessageType = "text";
           }
         }
-      }
-      else if (messageType == "media") {
+      } else if (messageType == "media") {
         // ✅ Media message - server sends media_url directly
         if (mediaUrl.isNotEmpty) {
           final fileName = mediaUrl.split('/').last;
@@ -369,13 +565,6 @@ class ChatService {
           }
 
           finalMessageType = "media";
-
-          // ✅ FIX: Check if this is replacing a temporary message
-          if (tempId != null && tempId.startsWith('temp_')) {
-            print("🔄 Replacing temporary media message: $tempId");
-            // Temporary message will be automatically replaced via updateMessageId
-          }
-
           print("✅ Media message processed: $finalContent");
 
           // Test the media URL
@@ -385,31 +574,44 @@ class ChatService {
           finalMessageType = "text";
           print("❌ Media message but no media_url found in data");
         }
-      }
-      else if (messageType == "text") {
+      } else if (messageType == "text") {
         // Plain text message
         finalContent = messageContent;
         finalMessageType = "text";
         print("✅ Plain text message received: $finalContent");
-      }
-      else {
+      } else {
         // Handle unknown message types gracefully
         print("⚠️ Unknown message type: $messageType, treating as text");
         finalContent = messageContent.isNotEmpty ? messageContent : "[Message]";
         finalMessageType = "text";
       }
 
-      // Create and save message
+      // ✅ STEP 5: FINAL DUPLICATE CHECK - Check if we already have this exact message
+      final finalExistingCheck = _messageBox.values.firstWhereOrNull(
+            (msg) =>
+        msg.chatId == chatId &&
+            msg.senderId == senderId &&
+            msg.messageContent == finalContent &&
+            msg.timestamp.difference(messageTimestamp).inSeconds.abs() < 3,
+      );
+
+      if (finalExistingCheck != null) {
+        print("⚠️ FINAL DUPLICATE CHECK FAILED - Message already exists: $idToProcess");
+        print("   Existing ID: ${finalExistingCheck.messageId}");
+        return;
+      }
+
+      // ✅ STEP 6: Create and save message
       final msg = Message(
-        messageId: idToProcess, // This will be the final messageId after conversion
-        chatId: int.tryParse(data["chat_id"]?.toString() ?? "0") ?? 0,
-        senderId: int.tryParse(data["sender_id"]?.toString() ?? "0") ?? 0,
+        messageId: idToProcess,
+        chatId: chatId,
+        senderId: senderId,
         receiverId: int.tryParse(data["receiver_id"]?.toString() ?? "0") ?? 0,
         messageContent: finalContent,
         messageType: finalMessageType,
         isRead: 0,
         isDelivered: forceDelivered ? 1 : 0,
-        timestamp: DateTime.tryParse(data["timestamp"]?.toString() ?? "") ?? DateTime.now(),
+        timestamp: messageTimestamp,
         senderName: data["sender_name"]?.toString(),
         receiverName: data["receiver_name"]?.toString(),
         senderPhoneNumber: data["sender_phone"]?.toString(),
@@ -417,12 +619,12 @@ class ChatService {
       );
 
       await saveMessageLocal(msg);
-      print("💾 Message saved: $idToProcess");
+      print("💾 Message saved successfully: $idToProcess");
 
-      // Notify UI
+      // ✅ STEP 7: Notify UI
       _newMessageController.add(msg);
 
-      // Send delivery confirmation
+      // ✅ STEP 8: Send delivery confirmation if this message is for current user
       final isForCurrentUser = currentUserId.toString() != data["sender_id"].toString();
       if (isForCurrentUser && _socket != null && _socket!.connected) {
         _socket!.emit("message_delivered", {
@@ -435,9 +637,16 @@ class ChatService {
         print("📤 Delivery confirmed: $idToProcess");
       }
 
+      print("✅ Message processing completed successfully: $idToProcess");
+
     } catch (e, st) {
       print("❌ Error in _handleIncomingData: $e");
       print("Stack: $st");
+    } finally {
+      // ✅ ALWAYS remove from processed IDs
+      if (idToProcess != null) {
+        _processedMessageIds.remove(idToProcess);
+      }
     }
   }
 
@@ -463,6 +672,19 @@ class ChatService {
     try {
       final msg = _messageBox.get(tempId) as Message?;
       if (msg != null) {
+        // ✅ FIRST: Check if new message ID already exists
+        final existingWithNewId = _messageBox.values.firstWhereOrNull(
+              (m) => m.messageId == newMessageId,
+        );
+
+        if (existingWithNewId != null) {
+          print("⚠️ Message with new ID already exists: $newMessageId");
+          // Delete the temporary message to avoid duplicates
+          await _messageBox.delete(tempId);
+          return;
+        }
+
+        // ✅ Update message ID and status
         msg.messageId = newMessageId;
         msg.isDelivered = status;
 
@@ -530,7 +752,24 @@ class ChatService {
   // ------------------- SAVE / READ -------------------
   static Future<void> saveMessageLocal(Message message) async {
     try {
+      // ✅ FINAL SAFETY CHECK before saving
+      final existingMessage = _messageBox.values.firstWhereOrNull(
+            (msg) =>
+        msg.messageId == message.messageId ||
+            (msg.chatId == message.chatId &&
+                msg.senderId == message.senderId &&
+                msg.messageContent == message.messageContent &&
+                msg.timestamp.difference(message.timestamp).inSeconds.abs() < 3),
+      );
+
+      if (existingMessage != null) {
+        print("⚠️ DUPLICATE BLOCKED in saveMessageLocal: ${message.messageId}");
+        print("   Existing ID: ${existingMessage.messageId}");
+        return;
+      }
+
       await _messageBox.put(message.messageId, message);
+      print("💾 Message saved to local storage: ${message.messageId}");
     } catch (e) {
       print("❌ Error saving message locally: $e");
     }
@@ -589,13 +828,11 @@ class ChatService {
     }
   }
 
-  // ChatService.dart mein getLocalMessages function update karo
-
   static List<Message> getLocalMessages(int chatId) {
     try {
       return _messageBox.values
           .where((m) => m.chatId == chatId)
-          .where((m) => !m.messageId.toString().startsWith('temp_')) // ✅ Temporary messages filter
+          .where((m) => !m.messageId.toString().startsWith('temp_'))
           .cast<Message>()
           .toList()
         ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
@@ -704,7 +941,6 @@ class ChatService {
       }
     }
 
-    //final tempId = 'temp_${DateTime.now().microsecondsSinceEpoch}';
     final userId = _authBox.get('userId');
     if (userId == null) throw Exception("User ID not found");
 
@@ -715,7 +951,7 @@ class ChatService {
         chatId: chatId,
         senderId: userId,
         receiverId: receiverId,
-        messageContent: mediaPath, // Show local path for preview
+        messageContent: mediaPath,
         messageType: 'media',
         isRead: 0,
         isDelivered: 0,
@@ -753,9 +989,7 @@ class ChatService {
     }
   }
 
-  /// Background processing and uploading of media - CORRECTED FOR SERVER API
-// ChatService.dart mein _processAndSendMedia function update karo
-
+  /// Background processing and uploading of media
   static Future<void> _processAndSendMedia({
     required String mediaPath,
     required int chatId,
@@ -838,11 +1072,11 @@ class ChatService {
 
       print("✅ Media uploaded successfully: $mediaUrl");
 
-      // ✅ STEP 4: CRITICAL FIX - Send final media message via socket (jaise text message bhejte hain)
+      // ✅ STEP 4: Send final media message via socket
       final fileName = mediaUrl.split('/').last;
       final fullMediaUrl = '${Config.baseNodeApiUrl}/media/file/$fileName';
 
-      // ✅ Prepare encrypted payload for media (jaise text ke liye karte hain)
+      // ✅ Prepare encrypted payload for media
       final Map<String, dynamic> mediaPayload = {
         'type': 'media',
         'content': fullMediaUrl,
@@ -853,7 +1087,7 @@ class ChatService {
       final encryptedContent = encryptedData['content'];
       final encryptedType = encryptedData['type'];
 
-      // ✅ Send via socket EXACTLY like text message
+      // ✅ Send via socket
       if (_socket != null && _socket!.connected) {
         _socket!.emit("send_message", {
           "chat_id": chatId,
@@ -862,7 +1096,7 @@ class ChatService {
           "message_text": encryptedContent,
           "message_type": encryptedType,
           "temp_id": tempId,
-          "media_url": fullMediaUrl, // ✅ ADD media_url for instant delivery
+          "media_url": fullMediaUrl,
           "sender_name": senderName,
           "receiver_name": receiverName,
           "sender_phone": senderPhoneNumber,
@@ -906,7 +1140,7 @@ class ChatService {
         required Function(double) onProgress,
       }) async {
     try {
-      const int chunkSize = 512 * 1024; // 512 KB
+      const int chunkSize = 512 * 1024;
       final int totalChunks = (fileBytes.length / chunkSize).ceil();
 
       print("📤 Uploading $fileName in $totalChunks chunks...");
@@ -999,7 +1233,7 @@ class ChatService {
     }
   }
 
-  /// Send push notification for media - CORRECTED
+  /// Send push notification for media
   static Future<void> _sendPushNotification(int receiverId, String messageText, int chatId, int senderId, String senderName) async {
     try {
       const apiUrl = 'http://184.168.126.71:3000/api/send-notification';
@@ -1194,59 +1428,15 @@ class ChatService {
     if (_socket == null || !_socket!.connected) {
       print("⚠️ Socket disconnected. Reconnecting...");
       initSocket();
+      // Wait for connection
+      await Future.delayed(const Duration(seconds: 2));
     }
 
-    _statusUpdateTimer?.cancel();
-    _statusUpdateTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
-      if (_socket != null && _socket!.connected) {
-        _socket!.emit("user_status", {"userId": userId, "status": "online"});
-        print("🌐 Proactively sending 'online' status heartbeat.");
-      } else {
-        _statusUpdateTimer?.cancel();
-      }
-    });
-  }
-
-  static Future<String> _parallelDownload(String url, String fileName, {int parts = 4}) async {
-    final head = await _dio.head(url);
-    final total = int.tryParse(head.headers.value("content-length") ?? "0") ?? 0;
-    if (total <= 0) throw Exception("Invalid content-length for download");
-
-    final partSize = (total / parts).ceil();
-    final dir = await getApplicationDocumentsDirectory();
-    final outFile = File('${dir.path}/$fileName');
-
-    if (outFile.existsSync()) await outFile.delete();
-
-    final partsData = List<Uint8List?>.filled(parts, null);
-    final futures = <Future>[];
-
-    for (int i = 0; i < parts; i++) {
-      final start = i * partSize;
-      final end = min(((i + 1) * partSize - 1), total - 1);
-      final range = "bytes=$start-$end";
-
-      futures.add(_dio.get<Uint8List>(url, options: Options(responseType: ResponseType.bytes, headers: {"Range": range})).then((r) => partsData[i] = r.data));
+    // Ensure user status is online
+    if (_socket != null && _socket!.connected) {
+      _socket!.emit("user_status", {"userId": userId, "status": "online"});
+      print("🌐 Ensured online status");
     }
-
-    await Future.wait(futures);
-
-    final decryptedBytes = await compute(
-        _decryptAndDecompressParts,
-        {'partsData': partsData}
-    );
-
-    await outFile.writeAsBytes(decryptedBytes);
-    return outFile.path;
-  }
-
-  static Future<Uint8List> _decryptAndDecompressParts(Map<String, dynamic> args) async {
-    await CryptoManager().init();
-
-    final List<Uint8List?> partsData = args['partsData'];
-    final combinedBytes = partsData.expand((part) => part!).toList();
-    final decrypted = await CryptoManager().decryptAndDecompressBytes(Uint8List.fromList(combinedBytes));
-    return decrypted;
   }
 
   static Future<void> markMessageRead(String messageId, int chatId) async {
