@@ -13,25 +13,32 @@ import 'dart:io';
 import 'package:archive/archive.dart';
 import 'package:flutter/foundation.dart';
 import 'dart:ui';
+import '../config.dart'; // ✅ Config import किया
 
 Future<void> fetchPhoneContactsInIsolate(Map<String, dynamic> args) async {
   final ownerUserId = args['ownerUserId'] as int;
   final rootIsolateToken = args['rootIsolateToken'] as RootIsolateToken?;
-
   if (rootIsolateToken != null) {
     BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
   }
-
   await ContactService.fetchPhoneContacts(ownerUserId: ownerUserId);
 }
 
-class ContactService {
+
+class ContactService { // Class name unchanged
   static ValueNotifier<int> contactChangeNotifier = ValueNotifier(0);
   static Box<Contact> get _contactBox => Hive.box<Contact>('contacts');
   static Box get _metaBox => Hive.box('meta');
 
-  static const String baseUrl = "http://184.168.126.71/api";
+  // ✅ FIX 2: Saved Config से baseUrl का उपयोग
+  static const String baseUrl = Config.basePhpApiUrl;
   static const String secureEndpoint = "$baseUrl/check_number.php";
+
+  // ✅ New: Contact map for faster lookups (ChatsTab के लिए)
+  static Map<String, Contact> _contactMap = {};
+
+  // Getter for compute function (अगर ChatsTab इस नाम का उपयोग करता है)
+  static Map<String, Contact> get contactMapForCompute => _contactMap;
 
   static final Uint8List _keyBytes = _hexToBytes(
     'b1b2b3b4b5b6b7b8b9babbbcbdbebff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff00',
@@ -40,10 +47,18 @@ class ContactService {
   static final _algo = AesGcm.with256bits();
   static final _secretKey = SecretKey(_keyBytes);
 
+  // ✅ New method to build the internal map (ChatsTab के लिए)
+  static void buildContactMap() {
+    _contactMap.clear();
+    for (var c in _contactBox.values) {
+      _contactMap[c.contactPhone] = c;
+    }
+  }
+
   static Future<void> fetchPhoneContacts({
     int ownerUserId = 0,
-    int chunkSize = 400,
-    int batchSize = 6,
+    int chunkSize = 200,
+    int batchSize = 7,
     bool force = false,
   }) async {
     final stopwatch = Stopwatch()..start();
@@ -72,9 +87,11 @@ class ContactService {
           .where((c) => c.ownerUserId == ownerUserId)
           .toList();
 
+      // ✅ FIX 3: Permanent deletion के बजाय isDeleted flag का उपयोग
       for (var hc in hiveContacts) {
-        if (!devicePhones.containsKey(hc.contactPhone)) {
-          await hc.delete();
+        if (!devicePhones.containsKey(hc.contactPhone) && !hc.isDeleted) {
+          hc.isDeleted = true;
+          await hc.save();
         }
       }
       final changedFcContacts = deviceContacts.where((c) {
@@ -92,6 +109,8 @@ class ContactService {
               ownerUserId: 0,
               contactName: "",
               contactPhone: "",
+              lastMessageTime: DateTime(2000), // ✅ FIX 1: Required field
+              isDeleted: false,                // ✅ Required field
             ),
           );
           if (existing.contactId == 0 ||
@@ -105,6 +124,7 @@ class ContactService {
       }).toList();
 
       if (changedFcContacts.isEmpty) {
+
         stopwatch.stop();
         print('✅ Contact sync finished: No changes. Time taken: ${stopwatch.elapsedMilliseconds}ms');
         return;
@@ -122,6 +142,8 @@ class ContactService {
               contactName: c.displayName,
               contactPhone: phone,
               updatedAt: DateTime.now(),
+              lastMessageTime: DateTime(2000), // ✅ Required field
+              isDeleted: false,                // ✅ Required field
             ));
             syncedPhones.add(phone);
           }
@@ -243,9 +265,11 @@ class ContactService {
 
   static List<Contact> getLocalContacts({int ownerUserId = 0}) {
     final uniqueContacts = _contactBox.values
-        .where((c) => c.ownerUserId == ownerUserId)
+        .where((c) => c.ownerUserId == ownerUserId && !c.isDeleted) // ✅ isDeleted check जोड़ा गया
         .toList();
 
+    // Map for deduplication is not needed if only one phone number per contact is stored,
+    // but keeping it as per your original logic.
     final Map<String, Contact> uniqueMap = {};
     for (var c in uniqueContacts) {
       uniqueMap[c.contactPhone] = c;
@@ -257,12 +281,18 @@ class ContactService {
       ..sort((a, b) => a.contactName.compareTo(b.contactName));
   }
 
-  // 🆕 ContactService क्लास में इस विधि को जोड़ें
   static Future<Contact?> getContactByAppUserId(int appUserId) async {
     final box = Hive.box<Contact>('contacts');
     final contact = box.values.firstWhere(
-          (c) => c.appUserId == appUserId,
-      orElse: () => Contact(contactId: 0, ownerUserId: 0, contactName: "", contactPhone: ""),
+          (c) => c.appUserId == appUserId && !c.isDeleted, // isDeleted check
+      orElse: () => Contact(
+        contactId: 0,
+        ownerUserId: 0,
+        contactName: "",
+        contactPhone: "",
+        lastMessageTime: DateTime(2000), // ✅ Required field
+        isDeleted: false,                // ✅ Required field
+      ),
     );
     return contact.contactId == 0 ? null : contact;
   }
@@ -273,12 +303,14 @@ class ContactService {
       if (normalizedNumber.isEmpty) return null;
 
       final contact = _contactBox.values.firstWhere(
-            (c) => c.contactPhone == normalizedNumber,
+            (c) => c.contactPhone == normalizedNumber && !c.isDeleted, // isDeleted check
         orElse: () => Contact(
           contactId: 0,
           ownerUserId: 0,
           contactName: "",
           contactPhone: "",
+          lastMessageTime: DateTime(2000), // ✅ Required field
+          isDeleted: false,                // ✅ Required field
         ),
       );
 
@@ -290,6 +322,9 @@ class ContactService {
   }
 
   static Future<void> saveOrUpdateContacts(List<Contact> contacts) async {
+    // saveOrUpdateContacts में buildContactMap() कॉल नहीं है, इसलिए इसे जोड़ें
+    // ताकि ChatsTab द्वारा उपयोग किया जाने वाला map अपडेट हो जाए।
+
     final contactsToSave = <Contact>[];
     for (final c in contacts) {
       final existingContact = _contactBox.values.firstWhere(
@@ -301,6 +336,8 @@ class ContactService {
           ownerUserId: c.ownerUserId,
           contactName: "",
           contactPhone: "",
+          lastMessageTime: DateTime(2000), // ✅ Required field
+          isDeleted: false,                // ✅ Required field
         ),
       );
       if (existingContact.contactId == 0) {
@@ -316,6 +353,8 @@ class ContactService {
     if (contactsToSave.isNotEmpty) {
       await _contactBox.addAll(contactsToSave);
     }
+    // ✅ buildContactMap कॉल जोड़ा गया
+    buildContactMap();
     contactChangeNotifier.value++;
   }
 
@@ -323,5 +362,8 @@ class ContactService {
     final toDelete =
     _contactBox.values.where((c) => c.ownerUserId == ownerUserId).toList();
     for (var c in toDelete) await c.delete();
+    // ✅ buildContactMap कॉल जोड़ा गया
+    buildContactMap();
+    contactChangeNotifier.value++;
   }
 }

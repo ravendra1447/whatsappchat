@@ -8,6 +8,7 @@ environment:
   sdk: ^3.8.1
 
 dependencies:
+
   photo_view: ^0.14.0
   wakelock_plus: ^1.1.1
 

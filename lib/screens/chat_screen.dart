@@ -1,8 +1,8 @@
 // lib/pages/chat_screen.dart
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:http/http.dart' as http;
@@ -12,6 +12,7 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'package:intl/intl.dart';
 import 'package:collection/collection.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:path_provider/path_provider.dart';
 
 // Import the necessary models and services
 import '../main.dart';
@@ -21,6 +22,7 @@ import '../services/local_auth_service.dart';
 import '../services/contact_service.dart';
 import 'new_chat_page.dart';
 import 'media_viewer_screen.dart';
+import '../widgets/chat_image.dart';
 
 // Helper function to format date headers
 String formatDateHeader(DateTime date) {
@@ -62,7 +64,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final FocusNode _focusNode = FocusNode();
 
   Set<String> selectedMessageIds = {};
-  final ScrollController _scrollController = ScrollController();
+  late ScrollController _scrollController;
   File? _imageFile;
   final _messageBox = Hive.box<Message>('messages');
   final _authBox = Hive.box('authBox');
@@ -70,6 +72,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _isTyping = false;
   bool _isOtherUserTyping = false;
   bool _isSending = false;
+  bool _isLoadingMore = false;
   Timer? _typingTimer;
   String _userStatus = "offline";
   int _lastReadMessageId = 0;
@@ -80,6 +83,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   StreamSubscription? _typingSubscription;
   StreamSubscription? _statusSubscription;
   StreamSubscription? _newMessageSubscription;
+  StreamSubscription? _uploadProgressSubscription;
+  StreamSubscription? _messageDeliveredSubscription;
 
   bool _isKeyboardOpen = false;
   bool _isFirstLoad = true;
@@ -89,10 +94,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   // ✅ DUPLICATE PROTECTION
   final Set<String> _processedMessageIds = {};
 
+  // ✅ UPLOAD PROGRESS TRACKING
+  final Map<String, double> _uploadProgress = {};
+
+  // ✅ WHATSAPP-STYLE IMAGE CACHE - INSTANT LOADING
+  final Map<String, File> _imageCache = {};
+  final Set<String> _imageDownloadInProgress = {};
+  final Set<String> _loadedFullImages = {};
+
   // ✅ WHATSAPP-LIKE IMAGE QUALITY SETTINGS
   static const double _maxImageWidth = 1080;
   static const double _maxImageHeight = 1920;
-  static const int _imageQuality = 90;
+  static const int _imageQuality = 75;
+
+  // ✅ LOAD MORE MESSAGES
+  DateTime _oldestMessageTime = DateTime.now();
 
   // ✅ PERMANENT FIX: Use Hive to store loaded status
   bool get _areMessagesLoaded {
@@ -103,13 +119,36 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _authBox.put('messages_loaded_${widget.chatId}', value);
   }
 
-  // ✅ Add this constant for API base URL
+  // ✅ THUMBNAIL URL GENERATOR
+  String _generateThumbnailUrl(String fullImageUrl) {
+    if (fullImageUrl.contains('_full.')) {
+      return fullImageUrl.replaceAll('_full.', '_thumb.');
+    }
+
+    if (fullImageUrl.contains('.jpg')) {
+      return fullImageUrl.replaceAll('.jpg', '_thumb.jpg');
+    }
+
+    if (fullImageUrl.contains('.jpeg')) {
+      return fullImageUrl.replaceAll('.jpeg', '_thumb.jpeg');
+    }
+
+    if (fullImageUrl.contains('.png')) {
+      return fullImageUrl.replaceAll('.png', '_thumb.png');
+    }
+
+    return fullImageUrl;
+  }
+
+  // ✅ API BASE URL
   static const String apiBase = "http://184.168.126.71/api";
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+
+    _scrollController = ScrollController(keepScrollOffset: true);
 
     ChatService.initSocket();
     ChatService.ensureConnected();
@@ -122,6 +161,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
     });
 
+    // ✅ IMMEDIATE SCROLL TO BOTTOM ON INIT
     SchedulerBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         _jumpToBottom();
@@ -149,17 +189,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _hasInitialScrollDone = true;
     });
 
-    Future.delayed(const Duration(milliseconds: 300), () {
-      if (mounted && !_hasInitialScrollDone) {
-        _jumpToBottom();
-        _hasInitialScrollDone = true;
-      }
-    });
-
     // ✅ FIXED: STRONG DUPLICATE PROTECTION IN NEW MESSAGE LISTENER
     _newMessageSubscription = ChatService.onNewMessage.listen((msg) async {
       if (mounted && msg.chatId == widget.chatId) {
-        // ✅ STRONG DUPLICATE CHECK - Multiple layers
         if (_processedMessageIds.contains(msg.messageId)) {
           print("⚠️ DUPLICATE BLOCKED in UI: ${msg.messageId}");
           return;
@@ -167,12 +199,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
         _processedMessageIds.add(msg.messageId);
 
-        // Auto-clean after 30 seconds
         Future.delayed(const Duration(seconds: 30), () {
           _processedMessageIds.remove(msg.messageId);
         });
 
-        // ✅ CHECK IN HIVE FIRST
         final existingMessage = _messageBox.values.firstWhereOrNull(
               (existingMsg) => existingMsg.messageId == msg.messageId && existingMsg.chatId == widget.chatId,
         );
@@ -187,6 +217,41 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         } else {
           print("⚠️ Duplicate message from socket: ${msg.messageId}");
         }
+      }
+    });
+
+    // ✅ UPLOAD PROGRESS LISTENER
+    _uploadProgressSubscription = ChatService.onUploadProgress.listen((progressData) {
+      final tempId = progressData['tempId'];
+      final progress = progressData['progress'];
+
+      if (mounted && tempId != null) {
+        setState(() {
+          if (progress >= 0) {
+            _uploadProgress[tempId] = progress;
+          } else {
+            _uploadProgress.remove(tempId);
+          }
+        });
+
+        if (progress == 100) {
+          print("✅ Upload completed for: $tempId");
+          Future.delayed(const Duration(seconds: 2), () {
+            if (mounted) {
+              setState(() {
+                _uploadProgress.remove(tempId);
+              });
+            }
+          });
+        }
+      }
+    });
+
+    // ✅ MESSAGE DELIVERED LISTENER - FOR TICKS UPDATE
+    _messageDeliveredSubscription = ChatService.onMessageDelivered.listen((messageId) {
+      if (mounted) {
+        print("✅ Message delivered update: $messageId");
+        setState(() {}); // Refresh UI to update ticks
       }
     });
 
@@ -209,6 +274,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _scrollController.addListener(() {
       _updateLastReadMessageId();
       _updateScrollToBottomPreference();
+
+      if (_scrollController.offset <= _scrollController.position.minScrollExtent + 100) {
+        _loadMoreMessages();
+      }
     });
 
     _focusNode.addListener(() {
@@ -234,8 +303,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _typingSubscription?.cancel();
     _statusSubscription?.cancel();
     _newMessageSubscription?.cancel();
+    _uploadProgressSubscription?.cancel();
+    _messageDeliveredSubscription?.cancel();
     _scrollController.dispose();
-    _processedMessageIds.clear(); // ✅ CLEANUP
+    _processedMessageIds.clear();
+    _uploadProgress.clear();
+    _imageCache.clear();
+    _imageDownloadInProgress.clear();
     super.dispose();
   }
 
@@ -244,19 +318,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     super.didChangeMetrics();
     final bottomInset = WidgetsBinding.instance.window.viewInsets.bottom;
 
-    if (bottomInset > 0.0 && _focusNode.hasFocus && _shouldScrollToBottom) {
-      _jumpToBottom();
-    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (bottomInset > 0.0 && _focusNode.hasFocus && _shouldScrollToBottom) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
   }
 
+  // ✅ IMPROVED JUMP TO BOTTOM - WHATSAPP STYLE
   void _jumpToBottom() {
     if (!_scrollController.hasClients) return;
-    final maxScroll = _scrollController.position.maxScrollExtent;
-    if (maxScroll <= 0) return;
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients && _shouldScrollToBottom) {
-        _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+        try {
+          final maxScroll = _scrollController.position.maxScrollExtent;
+          if (maxScroll > 0) {
+            _scrollController.jumpTo(maxScroll);
+          }
+        } catch (e) {
+          print("Scroll error: $e");
+        }
       }
     });
   }
@@ -350,6 +436,30 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
+  // ✅ LOAD MORE MESSAGES FOR INFINITE SCROLL
+  Future<void> _loadMoreMessages() async {
+    if (_isLoadingMore) return;
+
+    setState(() => _isLoadingMore = true);
+
+    try {
+      final messages = _messageBox.values
+          .where((msg) => msg.chatId == widget.chatId)
+          .toList();
+
+      if (messages.isNotEmpty) {
+        messages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+        _oldestMessageTime = messages.first.timestamp;
+      }
+    } catch (e) {
+      print("Error loading more messages: $e");
+    } finally {
+      if (mounted) {
+        setState(() => _isLoadingMore = false);
+      }
+    }
+  }
+
   // ✅ FIXED: _fetchMessages with STRONG duplicate prevention
   Future<void> _fetchMessages() async {
     try {
@@ -380,7 +490,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
             if (idToProcess == null) continue;
 
-            // ✅ STRONGER DUPLICATE CHECK
             if (_processedMessageIds.contains(idToProcess)) {
               duplicateCount++;
               continue;
@@ -514,6 +623,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           mediaUrl: message.messageContent,
           messageId: message.messageId,
           isLocalFile: isLocalFile,
+          chatId: widget.chatId,
         ),
       ),
     );
@@ -562,7 +672,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
         _jumpToBottom();
 
-        ChatService.sendMediaMessage(
+        await ChatService.sendMediaMessage(
           chatId: widget.chatId,
           receiverId: widget.otherUserId,
           mediaPath: _imageFile!.path,
@@ -682,43 +792,163 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  Widget _buildMediaLoading() {
+  // ✅ WHATSAPP-STYLE IMAGE CACHE MANAGEMENT
+  Future<File?> _getCachedImage(String mediaUrl) async {
+    final fileName = mediaUrl.split('/').last;
+    final appDir = await getTemporaryDirectory();
+    final cacheFile = File('${appDir.path}/$fileName');
+
+    if (await cacheFile.exists()) {
+      return cacheFile;
+    }
+    return null;
+  }
+
+  Future<void> _downloadAndCacheImage(String mediaUrl, String messageId) async {
+    try {
+      final fileName = mediaUrl.split('/').last;
+      final appDir = await getTemporaryDirectory();
+      final cacheFile = File('${appDir.path}/$fileName');
+
+      // Download image
+      final response = await http.get(Uri.parse(mediaUrl));
+      if (response.statusCode == 200) {
+        await cacheFile.writeAsBytes(response.bodyBytes);
+        _imageCache[mediaUrl] = cacheFile;
+
+        // Update UI
+        if (mounted) {
+          setState(() {});
+        }
+        print("✅ Image cached: $fileName");
+      }
+    } catch (e) {
+      print('❌ Image download failed: $e');
+    } finally {
+      _imageDownloadInProgress.remove(messageId);
+    }
+  }
+
+  // ✅ FIXED: WHATSAPP-STYLE IMAGE LOADING - INSTANT BLUR + HD
+  Widget _buildWhatsAppStyleImage(Message msg, String mediaUrl) {
+    return FutureBuilder<File?>(
+      future: _getCachedImage(mediaUrl),
+      builder: (context, snapshot) {
+        // ✅ CASE 1: Image already cached - SHOW HD IMMEDIATELY
+        if (snapshot.hasData && snapshot.data != null) {
+          final cachedFile = snapshot.data!;
+          _loadedFullImages.add(msg.messageId);
+
+          return Image.file(
+            cachedFile,
+            fit: BoxFit.cover,
+            width: double.infinity,
+            height: double.infinity,
+          );
+        }
+
+        // ✅ CASE 2: Downloading - Show INSTANT BLUR PREVIEW
+        else {
+          // Start background download if not already started
+          if (!_imageDownloadInProgress.contains(msg.messageId)) {
+            _imageDownloadInProgress.add(msg.messageId);
+            _downloadAndCacheImage(mediaUrl, msg.messageId);
+          }
+
+          return _buildDirectBlurPreview(mediaUrl);
+        }
+      },
+    );
+  }
+
+  // ✅ FIXED: DIRECT BLUR PREVIEW - NO BACKGROUND COLOR, INSTANT SHOW
+  Widget _buildDirectBlurPreview(String mediaUrl) {
+    return Stack(
+      children: [
+        // ✅ BLUR PREVIEW - INSTANT LOAD
+        CachedNetworkImage(
+          imageUrl: _generateThumbnailUrl(mediaUrl),
+          fit: BoxFit.cover,
+          width: double.infinity,
+          height: double.infinity,
+          placeholder: (context, url) => Container(), // EMPTY - NO BACKGROUND
+          errorWidget: (context, url, error) => Container(
+            color: Colors.grey[200],
+            child: const Icon(Icons.image, color: Colors.grey, size: 40),
+          ),
+          fadeInDuration: Duration.zero, // NO FADE - INSTANT SHOW
+          fadeOutDuration: Duration.zero,
+        ),
+
+        // ✅ LOADING INDICATOR OVERLAY
+        Container(
+          color: Colors.black12,
+          child: Center(
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ✅ OPTIMIZED DATE HEADER
+  Widget _buildDateHeader(String date) {
     return Container(
-      color: Colors.grey[200],
-      child: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(height: 8),
-            Text('Loading...', style: TextStyle(fontSize: 12)),
-          ],
+      margin: const EdgeInsets.symmetric(vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFFDCF8C6),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Text(
+        date,
+        style: const TextStyle(
+            color: Colors.black87,
+            fontSize: 12,
+            fontWeight: FontWeight.w500
         ),
       ),
     );
   }
 
+  // ✅ FIXED: BETTER MEDIA ERROR WIDGET
   Widget _buildMediaError(String url, String error) {
     return Container(
-      color: Colors.grey[300],
-      child: Column(
+      color: Colors.grey[200],
+      child: const Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.error_outline, color: Colors.red, size: 40),
+          Icon(Icons.image, color: Colors.grey, size: 40),
           SizedBox(height: 8),
-          Text('Failed to load', style: TextStyle(fontSize: 12)),
-          SizedBox(height: 4),
           Text(
-            'Tap to retry',
-            style: TextStyle(fontSize: 10, color: Colors.grey[600]),
+            'Image',
+            style: TextStyle(fontSize: 12, color: Colors.grey),
           ),
         ],
       ),
     );
   }
 
-  // ✅ WHATSAPP-STYLE LOCAL MEDIA PREVIEW with time and ticks inside
+  // ✅ WHATSAPP-STYLE LOCAL MEDIA PREVIEW
   Widget _buildLocalMediaPreview(String localPath, Message msg, bool isMe) {
+    final tempId = msg.messageId.toString();
+    final uploadProgress = _uploadProgress[tempId];
+    final isUploading = uploadProgress != null && uploadProgress < 100;
+
     return GestureDetector(
       onTap: () {
         Navigator.of(context).push(
@@ -727,6 +957,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               mediaUrl: localPath,
               messageId: 'local_preview',
               isLocalFile: true,
+              chatId: widget.chatId,
             ),
           ),
         );
@@ -734,50 +965,53 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       child: Container(
         constraints: BoxConstraints(
           maxWidth: MediaQuery.of(context).size.width * 0.65,
-          maxHeight: 300,
         ),
         child: Stack(
           children: [
-            // Image
+            // ✅ INSTANT LOCAL IMAGE SHOW
             ClipRRect(
               borderRadius: BorderRadius.circular(8),
-              child: Image.file(
-                File(localPath),
-                fit: BoxFit.cover,
-                width: double.infinity,
-                height: double.infinity,
-                errorBuilder: (context, error, stackTrace) {
-                  return _buildMediaError(localPath, error.toString());
-                },
-              ),
-            ),
-
-            // ✅ UPLOADING INDICATOR
-            Container(
-              color: Colors.black54,
-              child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    CircularProgressIndicator(
-                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                    ),
-                    SizedBox(height: 8),
-                    Text(
-                      'Sending...',
-                      style: TextStyle(color: Colors.white, fontSize: 12),
-                    ),
-                  ],
+              child: Container(
+                width: MediaQuery.of(context).size.width * 0.65,
+                height: 300,
+                child: Image.file(
+                  File(localPath),
+                  fit: BoxFit.cover,
+                  errorBuilder: (context, error, stackTrace) {
+                    return _buildMediaError(localPath, error.toString());
+                  },
                 ),
               ),
             ),
 
-            // ✅ TIME AND TICKS OVERLAY (WhatsApp-like)
+            // ✅ UPLOAD PROGRESS INDICATOR
+            if (isUploading && uploadProgress != null)
+              Positioned(
+                top: 8,
+                right: 8,
+                child: Container(
+                  padding: const EdgeInsets.all(6),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    '${uploadProgress.toInt()}%',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ),
+
+            // ✅ TIME AND TICKS OVERLAY
             Positioned(
               bottom: 6,
               right: 6,
               child: Container(
-                padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                 decoration: BoxDecoration(
                   color: Colors.black54,
                   borderRadius: BorderRadius.circular(10),
@@ -787,19 +1021,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   children: [
                     Text(
                       _formatTime(msg.timestamp),
-                      style: TextStyle(
+                      style: const TextStyle(
                         color: Colors.white,
                         fontSize: 11,
                         fontWeight: FontWeight.w400,
                       ),
                     ),
-                    if (isMe) SizedBox(width: 4),
+                    if (isMe) const SizedBox(width: 4),
                     if (isMe)
-                      Icon(
-                        Icons.access_time,
-                        size: 12,
-                        color: Colors.grey[300],
-                      ),
+                      _buildMessageTicks(msg, isUploading: isUploading),
                   ],
                 ),
               ),
@@ -810,82 +1040,97 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // ✅ WHATSAPP-STYLE MEDIA MESSAGE with time and ticks inside image
-  Widget _buildMediaMessage(Message msg, String mediaUrl, Color textColor) {
-    print("📸 Building media message - URL: $mediaUrl | Type: ${msg.messageType}");
-
-    final userId = LocalAuthService.getUserId();
-    final bool isMe = msg.senderId == userId;
-
-    // ✅ LOCAL FILE CHECK (Temporary media)
-    if (mediaUrl.startsWith('/') ||
-        mediaUrl.contains('cache') ||
-        mediaUrl.contains('temp_') ||
-        (File(mediaUrl).existsSync() && !mediaUrl.startsWith('http'))) {
-
-      return _buildLocalMediaPreview(mediaUrl, msg, isMe);
-    }
-
-    // ✅ SERVER MEDIA URL CHECK
-    if (mediaUrl.isEmpty ||
-        mediaUrl == "[Media URL Missing]" ||
-        mediaUrl == "[Media Decryption Failed]" ||
-        mediaUrl == "[Decryption Failed]" ||
-        !mediaUrl.startsWith('http')) {
-
-      return Container(
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.of(context).size.width * 0.65,
-          maxHeight: 200,
-        ),
-        padding: EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: Colors.grey[300],
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(Icons.error_outline, color: Colors.red, size: 40),
-            SizedBox(height: 8),
-            Text(
-              'Media not available',
-              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
-            ),
-          ],
-        ),
+  // ✅ FIXED: WHATSAPP-STYLE MESSAGE TICKS
+  Widget _buildMessageTicks(Message msg, {bool isUploading = false}) {
+    if (isUploading) {
+      return Icon(
+        Icons.access_time,
+        size: 12,
+        color: Colors.grey[300],
       );
     }
 
-    // ✅ SERVER MEDIA - WhatsApp-like with time and ticks
+    if (msg.isRead == 1) {
+      return const Icon(
+        Icons.done_all,
+        size: 12,
+        color: Colors.blue,
+      );
+    } else if (msg.isDelivered == 1) {
+      return const Icon(
+        Icons.done_all,
+        size: 12,
+        color: Colors.grey,
+      );
+    } else {
+      return const Icon(
+        Icons.done,
+        size: 12,
+        color: Colors.grey,
+      );
+    }
+  }
+
+  // ✅ ULTRA-FAST MEDIA LOADING - WhatsApp Style
+  Widget _buildMediaMessage(Message msg, String mediaUrl, Color textColor) {
+    final userId = LocalAuthService.getUserId();
+    final bool isMe = msg.senderId == userId;
+    final tempId = msg.messageId.toString();
+    final uploadProgress = _uploadProgress[tempId];
+    final isUploading = uploadProgress != null && uploadProgress < 100;
+
+    // ✅ INSTANT LOCAL PREVIEW
+    if (mediaUrl.startsWith('/') || File(mediaUrl).existsSync()) {
+      return _buildLocalMediaPreview(mediaUrl, msg, isMe);
+    }
+
+    // ✅ WHATSAPP-STYLE: FAST DOWNLOAD WITH BLUR PREVIEW
     return GestureDetector(
       onTap: () => _openImageFullScreen(msg),
       child: Container(
         constraints: BoxConstraints(
           maxWidth: MediaQuery.of(context).size.width * 0.65,
-          maxHeight: 300,
         ),
         child: Stack(
           children: [
-            // Image
+            // ✅ WHATSAPP-STYLE IMAGE LOADING - INSTANT BLUR + HD
             ClipRRect(
               borderRadius: BorderRadius.circular(8),
-              child: CachedNetworkImage(
-                imageUrl: mediaUrl,
-                placeholder: (context, url) => _buildMediaLoading(),
-                errorWidget: (context, url, error) => _buildMediaError(url, error.toString()),
-                fit: BoxFit.cover,
-                width: double.infinity,
-                height: double.infinity,
+              child: Container(
+                width: MediaQuery.of(context).size.width * 0.65,
+                height: 300,
+                child: _buildWhatsAppStyleImage(msg, mediaUrl),
               ),
             ),
 
-            // ✅ TIME AND TICKS OVERLAY (WhatsApp-like)
+            // ✅ UPLOAD PROGRESS
+            if (isUploading && uploadProgress != null)
+              Positioned(
+                top: 8,
+                right: 8,
+                child: Container(
+                  padding: const EdgeInsets.all(6),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    '${uploadProgress.toInt()}%',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ),
+
+            // ✅ TIME STAMP WITH TICKS
             Positioned(
               bottom: 6,
               right: 6,
               child: Container(
-                padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                 decoration: BoxDecoration(
                   color: Colors.black54,
                   borderRadius: BorderRadius.circular(10),
@@ -895,37 +1140,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   children: [
                     Text(
                       _formatTime(msg.timestamp),
-                      style: TextStyle(
+                      style: const TextStyle(
                         color: Colors.white,
                         fontSize: 11,
                         fontWeight: FontWeight.w400,
                       ),
                     ),
-                    if (isMe) SizedBox(width: 4),
+                    if (isMe) const SizedBox(width: 4),
                     if (isMe)
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (msg.isRead == 1)
-                            Icon(
-                              Icons.done_all,
-                              size: 12,
-                              color: Colors.blue,
-                            )
-                          else if (msg.isDelivered == 1)
-                            Icon(
-                              Icons.done_all,
-                              size: 12,
-                              color: Colors.grey[300],
-                            )
-                          else
-                            Icon(
-                              Icons.done,
-                              size: 12,
-                              color: Colors.grey[300],
-                            ),
-                        ],
-                      ),
+                      _buildMessageTicks(msg, isUploading: isUploading),
                   ],
                 ),
               ),
@@ -936,7 +1159,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // ✅ UPDATED MEDIA MESSAGE BUBBLE - Remove extra time section
+  // ✅ UPDATED MEDIA MESSAGE BUBBLE
   Widget _buildMediaMessageBubble(Message msg, {required bool isMe, required bool isSelected}) {
     final color = isMe ? const Color(0xFFDCF8C6) : Colors.white;
 
@@ -964,43 +1187,44 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           }
         });
       },
-      child: Container(
-        decoration: BoxDecoration(
-          border: isSelected ? Border.all(color: Colors.lightGreen, width: 2) : null,
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Align(
-          alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-          child: Container(
-            margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-            padding: const EdgeInsets.all(6),
-            constraints: BoxConstraints(
-              maxWidth: MediaQuery.of(context).size.width * 0.75,
-            ),
-            decoration: BoxDecoration(
-              color: color,
-              borderRadius: BorderRadius.only(
-                topLeft: isMe ? const Radius.circular(16) : const Radius.circular(2),
-                topRight: isMe ? const Radius.circular(2) : const Radius.circular(16),
-                bottomLeft: const Radius.circular(16),
-                bottomRight: const Radius.circular(16),
+      child: RepaintBoundary(
+        child: Container(
+          decoration: BoxDecoration(
+            border: isSelected ? Border.all(color: Colors.lightGreen, width: 2) : null,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Align(
+            alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+            child: Container(
+              margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+              padding: const EdgeInsets.all(6),
+              constraints: BoxConstraints(
+                maxWidth: MediaQuery.of(context).size.width * 0.75,
               ),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.grey.withOpacity(0.1),
-                  spreadRadius: 1,
-                  blurRadius: 2,
-                  offset: const Offset(0, 1),
+              decoration: BoxDecoration(
+                color: color,
+                borderRadius: BorderRadius.only(
+                  topLeft: isMe ? const Radius.circular(16) : const Radius.circular(2),
+                  topRight: isMe ? const Radius.circular(2) : const Radius.circular(16),
+                  bottomLeft: const Radius.circular(16),
+                  bottomRight: const Radius.circular(16),
                 ),
-              ],
-            ),
-            child: Column(
-              crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // ✅ Media with time and ticks inside image
-                _buildMediaMessage(msg, msg.messageContent, Colors.black),
-              ],
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.grey.withOpacity(0.1),
+                    spreadRadius: 1,
+                    blurRadius: 2,
+                    offset: const Offset(0, 1),
+                  ),
+                ],
+              ),
+              child: Column(
+                crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _buildMediaMessage(msg, msg.messageContent, Colors.black),
+                ],
+              ),
             ),
           ),
         ),
@@ -1008,7 +1232,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // ✅ UPDATED TEXT MESSAGE BUBBLE - Keep original for text messages
+  // ✅ UPDATED TEXT MESSAGE BUBBLE WITH FIXED TICKS
   Widget _buildMessageBubble(Message msg, {Key? key}) {
     final String msgId = msg.messageId.toString();
     final bool isSelected = selectedMessageIds.contains(msgId);
@@ -1040,110 +1264,88 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       bottomRight: const Radius.circular(16),
     );
 
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () {
-        if (selectedMessageIds.isNotEmpty) {
-          setState(() {
-            selectedMessageIds.clear();
-          });
-        } else if (_focusNode.hasFocus) {
-          _focusNode.unfocus();
-        } else if (isMediaMessage) {
-          _openImageFullScreen(msg);
-        }
-      },
-      onLongPress: () {
-        setState(() {
-          if (selectedMessageIds.contains(msgId)) {
-            selectedMessageIds.remove(msgId);
-          } else {
-            selectedMessageIds.clear();
-            selectedMessageIds.add(msgId);
+    return RepaintBoundary(
+      key: key,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {
+          if (selectedMessageIds.isNotEmpty) {
+            setState(() {
+              selectedMessageIds.clear();
+            });
+          } else if (_focusNode.hasFocus) {
+            _focusNode.unfocus();
+          } else if (isMediaMessage) {
+            _openImageFullScreen(msg);
           }
-        });
-      },
-      child: Container(
-        decoration: BoxDecoration(
-          border: isSelected ? Border.all(color: Colors.lightGreen, width: 2) : null,
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Align(
-          key: key,
-          alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-          child: Container(
-            margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-            padding: messageType == 'text' || contentDeleted
-                ? const EdgeInsets.symmetric(horizontal: 10, vertical: 8)
-                : const EdgeInsets.all(6),
-            constraints: BoxConstraints(
-              maxWidth: MediaQuery.of(context).size.width * 0.75,
-            ),
-            decoration: BoxDecoration(
-              color: color,
-              borderRadius: borderRadius,
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.grey.withOpacity(0.1),
-                  spreadRadius: 1,
-                  blurRadius: 2,
-                  offset: const Offset(0, 1),
-                ),
-              ],
-            ),
-            child: Column(
-              crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Message Content
-                if (contentDeleted)
-                  Text(content, style: TextStyle(color: Colors.red[800], fontSize: 14, fontStyle: FontStyle.italic))
-                else if (messageType == 'text')
-                  Text(content, style: TextStyle(color: textColor, fontSize: 16))
-                else if (messageType == 'media' || messageType == 'encrypted_media')
-                    _buildMediaMessage(msg, content, textColor)
-                  else
-                    Text("Unsupported message type", style: TextStyle(color: textColor, fontSize: 16)),
-
-                // ✅ FOR TEXT MESSAGES ONLY - Show time and ticks below
-                if (messageType == 'text' && !contentDeleted) ...[
-                  const SizedBox(height: 4),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        _formatTime(msg.timestamp),
-                        style: const TextStyle(color: Colors.black54, fontSize: 12),
-                      ),
-                      if (isMe) const SizedBox(width: 4),
-                      if (isMe)
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (msg.isRead == 1)
-                              const Icon(
-                                Icons.done_all,
-                                size: 16,
-                                color: Colors.blue,
-                              )
-                            else if (msg.isDelivered == 1)
-                              const Icon(
-                                Icons.done_all,
-                                size: 16,
-                                color: Colors.black54,
-                              )
-                            else
-                              const Icon(
-                                Icons.done,
-                                size: 16,
-                                color: Colors.black54,
-                              ),
-                          ],
-                        ),
-                    ],
+        },
+        onLongPress: () {
+          setState(() {
+            if (selectedMessageIds.contains(msgId)) {
+              selectedMessageIds.remove(msgId);
+            } else {
+              selectedMessageIds.clear();
+              selectedMessageIds.add(msgId);
+            }
+          });
+        },
+        child: Container(
+          decoration: BoxDecoration(
+            border: isSelected ? Border.all(color: Colors.lightGreen, width: 2) : null,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Align(
+            alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+            child: Container(
+              margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+              padding: messageType == 'text' || contentDeleted
+                  ? const EdgeInsets.symmetric(horizontal: 10, vertical: 8)
+                  : const EdgeInsets.all(6),
+              constraints: BoxConstraints(
+                maxWidth: MediaQuery.of(context).size.width * 0.75,
+              ),
+              decoration: BoxDecoration(
+                color: color,
+                borderRadius: borderRadius,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.grey.withOpacity(0.1),
+                    spreadRadius: 1,
+                    blurRadius: 2,
+                    offset: const Offset(0, 1),
                   ),
                 ],
-              ],
+              ),
+              child: Column(
+                crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (contentDeleted)
+                    Text(content, style: TextStyle(color: Colors.red[800], fontSize: 14, fontStyle: FontStyle.italic))
+                  else if (messageType == 'text')
+                    Text(content, style: TextStyle(color: textColor, fontSize: 16))
+                  else if (messageType == 'media' || messageType == 'encrypted_media')
+                      _buildMediaMessage(msg, content, textColor)
+                    else
+                      Text("Unsupported message type", style: TextStyle(color: textColor, fontSize: 16)),
+
+                  if (messageType == 'text' && !contentDeleted) ...[
+                    const SizedBox(height: 4),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _formatTime(msg.timestamp),
+                          style: const TextStyle(color: Colors.black54, fontSize: 12),
+                        ),
+                        if (isMe) const SizedBox(width: 4),
+                        if (isMe)
+                          _buildMessageTicks(msg),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
             ),
           ),
         ),
@@ -1372,46 +1574,59 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
                     messages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
 
-                    final Map<String, List<Message>> groupedMessages =
-                    groupBy(messages, (msg) => formatDateHeader(msg.timestamp));
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      _jumpToBottom();
+                    });
 
                     return CustomScrollView(
                       controller: _scrollController,
                       reverse: false,
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      slivers: groupedMessages.entries.map((entry) {
-                        final dateHeader = entry.key;
-                        final dailyMessages = entry.value;
-
-                        return SliverMainAxisGroup(
-                          slivers: [
-                            SliverPersistentHeader(
-                              pinned: true,
-                              delegate: _SliverDateHeaderDelegate(
-                                dateHeader,
+                      physics: const BouncingScrollPhysics(),
+                      cacheExtent: 2000,
+                      slivers: [
+                        if (_isLoadingMore)
+                          const SliverToBoxAdapter(
+                            child: Padding(
+                              padding: EdgeInsets.all(8.0),
+                              child: Center(
+                                child: SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                ),
                               ),
                             ),
-                            SliverList(
-                              delegate: SliverChildBuilderDelegate(
-                                    (context, index) {
-                                  final msg = dailyMessages[index];
-                                  final userId = LocalAuthService.getUserId();
+                          ),
 
-                                  if (msg.receiverId == userId && msg.isRead == 0) {
-                                    ChatService.markMessageRead(msg.messageId, widget.chatId);
-                                  }
+                        SliverList(
+                          delegate: SliverChildBuilderDelegate(
+                                (context, index) {
+                              if (index >= messages.length) return null;
 
-                                  return _buildMessageBubble(
-                                    msg,
-                                    key: ValueKey(msg.messageId),
-                                  );
-                                },
-                                childCount: dailyMessages.length,
-                              ),
-                            ),
-                          ],
-                        );
-                      }).toList(),
+                              final msg = messages[index];
+                              final previousMsg = index > 0 ? messages[index - 1] : null;
+                              final currentDate = formatDateHeader(msg.timestamp);
+                              final previousDate = previousMsg != null
+                                  ? formatDateHeader(previousMsg.timestamp)
+                                  : null;
+
+                              if (previousDate != currentDate) {
+                                return Column(
+                                  children: [
+                                    _buildDateHeader(currentDate),
+                                    _buildMessageBubble(msg, key: ValueKey(msg.messageId)),
+                                  ],
+                                );
+                              }
+
+                              return _buildMessageBubble(msg, key: ValueKey(msg.messageId));
+                            },
+                            childCount: messages.length,
+                            addAutomaticKeepAlives: true,
+                            addRepaintBoundaries: true,
+                          ),
+                        ),
+                      ],
                     );
                   },
                 ),
@@ -1423,36 +1638,5 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ),
       ),
     );
-  }
-}
-
-class _SliverDateHeaderDelegate extends SliverPersistentHeaderDelegate {
-  final String date;
-
-  _SliverDateHeaderDelegate(this.date);
-
-  @override
-  Widget build(BuildContext context, double shrinkOffset, bool overlapsContent) {
-    return Center(
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 10),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-        decoration: BoxDecoration(
-          color: const Color(0xFFDCF8C6),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Text(date, style: const TextStyle(color: Colors.black87)),
-      ),
-    );
-  }
-
-  @override
-  double get maxExtent => 50.0;
-  @override
-  double get minExtent => 50.0;
-
-  @override
-  bool shouldRebuild(_SliverDateHeaderDelegate oldDelegate) {
-    return oldDelegate.date != date;
   }
 }

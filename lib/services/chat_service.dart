@@ -618,11 +618,19 @@ class ChatService {
         receiverPhoneNumber: data["receiver_phone"]?.toString(),
       );
 
+      // ✅ FIX: SAVE TO HIVE BUT DON'T IMMEDIATELY EMIT STREAM EVENT
       await saveMessageLocal(msg);
       print("💾 Message saved successfully: $idToProcess");
 
-      // ✅ STEP 7: Notify UI
-      _newMessageController.add(msg);
+      // ✅ FIX: DELAYED STREAM EVENT - PREVENT MULTIPLE UI UPDATES
+      Future.delayed(const Duration(milliseconds: 100), () {
+        // ✅ CHECK AGAIN IF MESSAGE STILL EXISTS BEFORE EMITTING
+        final finalCheck = _messageBox.get(idToProcess);
+        if (finalCheck != null && _newMessageController.hasListener) {
+          _newMessageController.add(msg);
+          print("📢 Stream event emitted: $idToProcess");
+        }
+      });
 
       // ✅ STEP 8: Send delivery confirmation if this message is for current user
       final isForCurrentUser = currentUserId.toString() != data["sender_id"].toString();
@@ -1107,9 +1115,9 @@ class ChatService {
       }
 
       // ✅ STEP 5: Update local temporary message
-      existingTempMsg.messageContent = fullMediaUrl;
+      //existingTempMsg.messageContent = fullMediaUrl;
       existingTempMsg.isDelivered = 1;
-      await _messageBox.put(tempId, existingTempMsg);
+      //await _messageBox.put(tempId, existingTempMsg);
       _newMessageController.add(existingTempMsg);
 
       print("✅ Media message sent and local temp message updated: $fullMediaUrl");

@@ -1,14 +1,16 @@
 // lib/screens/new_chat_page.dart
 
 import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:hive_flutter/adapters.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:hive/hive.dart';
 import '../models/contact.dart';
 import '../services/contact_service.dart';
 import '../services/chat_service.dart';
 import '../services/local_auth_service.dart';
 import 'chat_screen.dart';
-import 'package:collection/collection.dart';
 
 class NewChatPage extends StatefulWidget {
   final bool isForForwarding;
@@ -18,132 +20,403 @@ class NewChatPage extends StatefulWidget {
 }
 
 class _NewChatPageState extends State<NewChatPage> {
-  List<Contact> allContacts = [];
-  String searchQuery = '';
+  // ✅ ULTRA FAST VARIABLES
+  late final Box<Contact> _contactBox;
+  final TextEditingController _searchController = TextEditingController();
+  final ValueNotifier<List<Contact>> _filteredContacts = ValueNotifier([]);
+  final ValueNotifier<String> _searchQuery = ValueNotifier('');
   Timer? _debounce;
-  final ScrollController _scrollController = ScrollController();
-  static const int _contactsPerPage = 50;
-  bool _isLoadingMore = false;
-  bool _hasMoreContacts = true;
-  List<Contact> _allHiveContacts = [];
-  int _contactsLoadedCount = 0;
 
-  late final VoidCallback _contactChangeListener;
+  // ✅ LAZY LOADING VARIABLES
+  final int _visibleItemCount = 30;
+  int _currentDisplayCount = 0;
+  List<Contact> _allContacts = [];
+
+  // ✅ LOADING STATES
+  bool _isInitialLoading = true;
+  bool _isLoadingMore = false;
+  final Stopwatch _loadTimer = Stopwatch();
 
   @override
   void initState() {
     super.initState();
-    _loadInitialContacts();
-    _scrollController.addListener(_onScroll);
-    _contactChangeListener = () {
-      _loadInitialContacts();
-    };
-    ContactService.contactChangeNotifier.addListener(_contactChangeListener);
+    _contactBox = Hive.box<Contact>('contacts');
+
+    // ✅ START LOADING TIMER
+    _loadTimer.start();
+
+    // ✅ IMMEDIATE LOAD
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _loadContactsInstantly();
+    });
+
+    _contactBox.listenable().addListener(_onHiveDataChanged);
   }
 
   @override
   void dispose() {
     _debounce?.cancel();
-    _scrollController.removeListener(_onScroll);
-    _scrollController.dispose();
-    ContactService.contactChangeNotifier.removeListener(_contactChangeListener);
+    _searchController.dispose();
+    _filteredContacts.dispose();
+    _searchQuery.dispose();
+    _contactBox.listenable().removeListener(_onHiveDataChanged);
+    _loadTimer.stop();
     super.dispose();
   }
 
-  void _onScroll() {
-    if (_scrollController.position.pixels ==
-        _scrollController.position.maxScrollExtent &&
-        !_isLoadingMore &&
-        _hasMoreContacts) {
-      _loadMoreContacts();
-    }
-  }
-
-  Future<void> _loadInitialContacts() async {
+  // ✅ ULTRA FAST CONTACT LOADING WITH SMART LOADING INDICATOR
+  void _loadContactsInstantly() {
     final userId = LocalAuthService.getUserId();
     if (userId == null) return;
 
-    _allHiveContacts = ContactService.getLocalContacts(ownerUserId: userId);
-
-    if (mounted) {
-      final initialContacts = _allHiveContacts.take(_contactsPerPage).toList();
+    // ✅ SHOW LOADING ONLY IF IT TAKES TIME
+    if (_loadTimer.elapsedMilliseconds > 100) { // 100ms से ज्यादा लगे तो loading दिखाएं
       setState(() {
-        allContacts = initialContacts;
-        _contactsLoadedCount = initialContacts.length;
-        _hasMoreContacts = _allHiveContacts.length > _contactsLoadedCount;
+        _isInitialLoading = true;
       });
     }
 
-    try {
-      await ContactService.fetchPhoneContacts(ownerUserId: userId);
-    } catch (e) {
-      print("Error fetching fresh contacts in background: $e");
+    // ✅ DIRECT HIVE ACCESS
+    _allContacts = _contactBox.values
+        .where((contact) =>
+    contact.ownerUserId == userId &&
+        !contact.isDeleted)
+        .toList();
+
+    // ✅ RESET DISPLAY COUNT
+    _currentDisplayCount = _visibleItemCount;
+
+    // ✅ IMMEDIATE UI UPDATE
+    _filteredContacts.value = _allContacts;
+
+    // ✅ HIDE LOADING AFTER DATA IS READY
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        setState(() {
+          _isInitialLoading = false;
+        });
+        _loadTimer.stop();
+      }
+    });
+  }
+
+  void _onHiveDataChanged() {
+    final userId = LocalAuthService.getUserId();
+    if (userId != null) {
+      _loadContactsInstantly();
     }
   }
 
-  Future<void> _loadMoreContacts() async {
-    if (!mounted || _isLoadingMore || !_hasMoreContacts) return;
+  void _onSearchChanged(String query) {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 50), () {
+      _searchQuery.value = query.trim().toLowerCase();
+      _applySearchFilter();
+    });
+  }
+
+  // ✅ OPTIMIZED SEARCH FILTER
+  void _applySearchFilter() {
+    final query = _searchQuery.value;
+
+    if (query.isEmpty) {
+      _filteredContacts.value = _allContacts;
+      _currentDisplayCount = _visibleItemCount;
+      return;
+    }
+
+    // ✅ FAST FILTERING
+    final filtered = _allContacts.where((contact) {
+      final nameMatch = contact.contactName.toLowerCase().contains(query);
+      final phoneMatch = contact.contactPhone.contains(query);
+      return nameMatch || phoneMatch;
+    }).toList();
+
+    _filteredContacts.value = filtered;
+    _currentDisplayCount = _visibleItemCount;
+  }
+
+  // ✅ FIXED: SAFE VISIBLE CONTACTS EXTRACTION
+  List<Contact> _getVisibleContacts(List<Contact> contacts) {
+    if (contacts.isEmpty) return [];
+
+    final endIndex = _currentDisplayCount.clamp(0, contacts.length);
+    return contacts.sublist(0, endIndex);
+  }
+
+  // ✅ LOAD MORE CONTACTS WITH LOADING INDICATOR
+  void _loadMoreContacts() {
+    final currentFiltered = _filteredContacts.value;
+
+    if (_currentDisplayCount >= currentFiltered.length || _isLoadingMore) {
+      return;
+    }
 
     setState(() {
       _isLoadingMore = true;
     });
 
-    final nextBatch = _allHiveContacts
-        .skip(_contactsLoadedCount)
-        .take(_contactsPerPage)
-        .toList();
-
-    if (nextBatch.isEmpty) {
+    // ✅ SIMULATE LOADING DELAY FOR BETTER UX
+    Future.delayed(const Duration(milliseconds: 300), () {
       if (mounted) {
         setState(() {
-          _hasMoreContacts = false;
+          _currentDisplayCount += _visibleItemCount;
+          _currentDisplayCount = _currentDisplayCount.clamp(0, currentFiltered.length);
           _isLoadingMore = false;
         });
       }
-      return;
-    }
-
-    if (mounted) {
-      setState(() {
-        allContacts.addAll(nextBatch);
-        _contactsLoadedCount = allContacts.length;
-        _hasMoreContacts = _allHiveContacts.length > _contactsLoadedCount;
-        _isLoadingMore = false;
-      });
-    }
-  }
-
-  void _onSearchChanged(String q) {
-    _debounce?.cancel();
-    _debounce = Timer(const Duration(milliseconds: 150), () {
-      setState(() => searchQuery = q.trim().toLowerCase());
     });
   }
 
-  Future<Map<String, List<Contact>>> getCategorizedContacts() async {
-    List<Contact> filtered = _allHiveContacts.where((c) {
-      final nameToShow = c.contactName.isNotEmpty ? c.contactName : c.contactPhone;
-      return nameToShow.toLowerCase().contains(searchQuery) ||
-          c.contactPhone.contains(searchQuery);
-    }).toList();
+  // ✅ SMART LOADING INDICATOR
+  Widget _buildLoadingIndicator() {
+    return Container(
+      color: Colors.white,
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const CircularProgressIndicator(
+            valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF075E54)),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'Loading ${_allContacts.length} contacts...',
+            style: const TextStyle(
+              color: Color(0xFF075E54),
+              fontSize: 16,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '${_allContacts.length} contacts found',
+            style: const TextStyle(
+              color: Colors.grey,
+              fontSize: 14,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
-    filtered.sort((a, b) {
-      final aName = a.contactName.isNotEmpty ? a.contactName : a.contactPhone;
-      final bName = b.contactName.isNotEmpty ? b.contactName : b.contactPhone;
-      return aName.compareTo(bName);
-    });
-
-    if (widget.isForForwarding) {
-      filtered = filtered.where((c) => c.isOnApp).toList();
+  // ✅ ULTRA FAST CONTACT LIST WITH LOADING STATES
+  Widget _buildContactList() {
+    // ✅ SHOW LOADING IF INITIAL LOAD IS TAKING TIME
+    if (_isInitialLoading) {
+      return _buildLoadingIndicator();
     }
 
-    final registered = filtered.where((c) => c.isOnApp).toList();
-    final nonRegistered = filtered.where((c) => !c.isOnApp).toList();
+    return ValueListenableBuilder<List<Contact>>(
+      valueListenable: _filteredContacts,
+      builder: (context, filteredContacts, child) {
+        if (filteredContacts.isEmpty && _searchQuery.value.isEmpty) {
+          return const Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.contacts, size: 64, color: Colors.grey),
+                SizedBox(height: 16),
+                Text(
+                  'No contacts found',
+                  style: TextStyle(fontSize: 16, color: Colors.grey),
+                ),
+                SizedBox(height: 8),
+                Text(
+                  'Sync your phone contacts to get started',
+                  style: TextStyle(fontSize: 14, color: Colors.grey),
+                ),
+              ],
+            ),
+          );
+        }
 
-    return {
-      "registered": registered,
-      "nonRegistered": nonRegistered,
-    };
+        if (filteredContacts.isEmpty && _searchQuery.value.isNotEmpty) {
+          return Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.search_off, size: 64, color: Colors.grey),
+                SizedBox(height: 16),
+                Text(
+                  'No contacts found for "${_searchQuery.value}"',
+                  style: TextStyle(fontSize: 16, color: Colors.grey),
+                ),
+              ],
+            ),
+          );
+        }
+
+        // ✅ GET VISIBLE CONTACTS FOR EACH CATEGORY
+        final registeredContacts = filteredContacts.where((c) => c.isOnApp).toList();
+        final nonRegisteredContacts = filteredContacts.where((c) => !c.isOnApp).toList();
+
+        final visibleRegistered = _getVisibleContacts(registeredContacts);
+        final visibleNonRegistered = _getVisibleContacts(nonRegisteredContacts);
+
+        final hasMoreRegistered = _currentDisplayCount < registeredContacts.length;
+        final hasMoreNonRegistered = _currentDisplayCount < nonRegisteredContacts.length;
+        final hasMoreContacts = hasMoreRegistered || hasMoreNonRegistered;
+
+        return Column(
+          children: [
+            // ✅ CONTACTS COUNT INDICATOR
+            if (filteredContacts.isNotEmpty)
+              Container(
+                padding: const EdgeInsets.all(8.0),
+                color: Colors.grey[50],
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      'Showing ${_currentDisplayCount.clamp(0, filteredContacts.length)} of ${filteredContacts.length} contacts',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.grey,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    if (_searchQuery.value.isNotEmpty)
+                      Text(
+                        'Search: "${_searchQuery.value}"',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Color(0xFF075E54),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+
+            // ✅ CONTACTS LIST
+            Expanded(
+              child: NotificationListener<ScrollNotification>(
+                onNotification: (scrollNotification) {
+                  if (scrollNotification is ScrollEndNotification &&
+                      scrollNotification.metrics.extentAfter < 100 &&
+                      hasMoreContacts &&
+                      !_isLoadingMore) {
+                    _loadMoreContacts();
+                  }
+                  return false;
+                },
+                child: ListView(
+                  padding: const EdgeInsets.all(8.0),
+                  children: [
+                    if (visibleRegistered.isNotEmpty)
+                      _buildSection("Registered on Zakhira", visibleRegistered, hasMoreRegistered),
+
+                    if (!widget.isForForwarding && visibleNonRegistered.isNotEmpty)
+                      _buildSection("Invite to Zakhira", visibleNonRegistered, hasMoreNonRegistered),
+
+                    if (_isLoadingMore)
+                      _buildLoadMoreLoader(),
+
+                    if (hasMoreContacts && !_isLoadingMore)
+                      _buildLoadMoreButton(),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // ✅ OPTIMIZED SECTION BUILDER
+  Widget _buildSection(String title, List<Contact> contacts, bool hasMore) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 4.0),
+          child: Row(
+            children: [
+              Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF075E54),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.green[50],
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  contacts.length.toString(),
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: Color(0xFF075E54),
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        ...contacts.map((contact) => ContactListItem(
+          contact: contact,
+          isForForwarding: widget.isForForwarding,
+          onInvite: () => _inviteUser(contact.contactPhone),
+          onTap: () => _openChat(contact),
+        )),
+
+        if (hasMore && !_isLoadingMore)
+          const SizedBox(height: 8),
+      ],
+    );
+  }
+
+  // ✅ LOAD MORE BUTTON
+  Widget _buildLoadMoreButton() {
+    return Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Center(
+        child: ElevatedButton.icon(
+          onPressed: _loadMoreContacts,
+          icon: const Icon(Icons.expand_more, size: 20),
+          label: const Text('Load More Contacts'),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: const Color(0xFF075E54),
+            foregroundColor: Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ✅ LOAD MORE LOADER
+  Widget _buildLoadMoreLoader() {
+    return const Padding(
+      padding: EdgeInsets.all(16.0),
+      child: Center(
+        child: Column(
+          children: [
+            CircularProgressIndicator(
+              strokeWidth: 2,
+              valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF075E54)),
+            ),
+            SizedBox(height: 8),
+            Text(
+              'Loading more contacts...',
+              style: TextStyle(
+                color: Colors.grey,
+                fontSize: 12,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   void _inviteUser(String phone) async {
@@ -162,17 +435,19 @@ class _NewChatPageState extends State<NewChatPage> {
     }
   }
 
+  // ✅ FAST CHAT OPENING
   Future<void> _openChat(Contact contact) async {
     if (contact.appUserId == null) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text("This user is not registered on app.")));
-      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("This user is not registered on app.")),
+      );
       return;
     }
+
     try {
       final chatId = await ChatService.createChat(contact.appUserId!);
       if (!mounted) return;
+
       if (chatId != null) {
         if (widget.isForForwarding) {
           Navigator.pop(context, chatId);
@@ -183,81 +458,23 @@ class _NewChatPageState extends State<NewChatPage> {
               builder: (_) => ChatScreen(
                 chatId: chatId,
                 otherUserId: contact.appUserId!,
-                otherUserName: contact.contactName,
+                otherUserName: contact.contactName.isNotEmpty
+                    ? contact.contactName
+                    : contact.contactPhone,
               ),
             ),
           );
         }
       } else {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-              content: Text('Could not open chat (chatId null)')));
-        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not create chat')),
+        );
       }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text("Error: $e")));
-      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Error: $e")),
+      );
     }
-  }
-
-  Widget buildContactList() {
-    if (_allHiveContacts.isEmpty && !_isLoadingMore && searchQuery.isEmpty) {
-      return const Center(child: Text('No contacts found.'));
-    }
-
-    return FutureBuilder<Map<String, List<Contact>>>(
-      future: getCategorizedContacts(),
-      builder: (context, snapshot) {
-        if (!snapshot.hasData) {
-          return const Center(child: CircularProgressIndicator());
-        }
-
-        final registered = snapshot.data!["registered"]!;
-        final nonRegistered = snapshot.data!["nonRegistered"]!;
-
-        return ListView(
-          controller: _scrollController,
-          children: [
-            if (registered.isNotEmpty)
-              buildSection("Registered Users", registered),
-            if (!widget.isForForwarding && nonRegistered.isNotEmpty)
-              buildSection("Invite Friends", nonRegistered),
-            if (_isLoadingMore)
-              const Center(child: CircularProgressIndicator()),
-          ],
-        );
-      },
-    );
-  }
-
-  Widget buildSection(String title, List<Contact> contacts) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Padding(
-          padding: const EdgeInsets.all(8.0),
-          child: Text(title,
-              style:
-              const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-        ),
-        ...contacts.map((c) => ListTile(
-          leading: CircleAvatar(
-              backgroundColor: c.isOnApp ? Colors.green : Colors.grey,
-              child: const Icon(Icons.person, color: Colors.white)),
-          title: Text(c.contactName.isNotEmpty ? c.contactName : c.contactPhone),
-          subtitle: c.contactName.isNotEmpty ? Text(c.contactPhone) : null,
-          trailing: c.isOnApp
-              ? null
-              : TextButton(
-              onPressed: () => _inviteUser(c.contactPhone),
-              child: const Text("Invite",
-                  style: TextStyle(color: Colors.green))),
-          onTap: () => _openChat(c),
-        )),
-      ],
-    );
   }
 
   @override
@@ -270,33 +487,139 @@ class _NewChatPageState extends State<NewChatPage> {
       ),
       body: Column(
         children: [
+          // ✅ OPTIMIZED SEARCH
           Padding(
-            padding: const EdgeInsets.all(8.0),
+            padding: const EdgeInsets.all(12.0),
             child: TextField(
+              controller: _searchController,
               decoration: InputDecoration(
-                  hintText: "Search name or number",
-                  prefixIcon: const Icon(Icons.search),
-                  border: OutlineInputBorder(
-                      borderRadius: const BorderRadius.all(Radius.circular(12)),
-                      borderSide: BorderSide.none),
-                  filled: true,
-                  fillColor: Colors.grey[200]),
+                hintText: "Search contacts...",
+                prefixIcon: const Icon(Icons.search),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12.0),
+                  borderSide: BorderSide.none,
+                ),
+                filled: true,
+                fillColor: Colors.grey[100],
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16.0),
+              ),
               onChanged: _onSearchChanged,
             ),
           ),
+
+          // ✅ QUICK ACTIONS
           if (!widget.isForForwarding) ...[
-            ListTile(
-                leading: const Icon(Icons.group, color: Colors.green),
-                title: const Text("New Group"),
-                onTap: () {}),
-            ListTile(
-                leading: const Icon(Icons.person_add, color: Colors.blue),
-                title: const Text("New Contact"),
-                onTap: () {}),
-            const Divider(),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12.0),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: _buildActionButton(
+                      icon: Icons.group,
+                      label: "New Group",
+                      onTap: () {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text("New Group feature coming soon")),
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 8.0),
+                  Expanded(
+                    child: _buildActionButton(
+                      icon: Icons.person_add,
+                      label: "New Contact",
+                      onTap: () {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text("New Contact feature coming soon")),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 24.0),
           ],
-          Expanded(child: buildContactList()),
+
+          // ✅ INSTANT CONTACTS LIST WITH SMART LOADING
+          Expanded(
+            child: _buildContactList(),
+          ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildActionButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return Card(
+      elevation: 2,
+      child: ListTile(
+        dense: true,
+        leading: Icon(icon, color: const Color(0xFF075E54)),
+        title: Text(
+          label,
+          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+        ),
+        onTap: onTap,
+      ),
+    );
+  }
+}
+
+// ✅ ULTRA OPTIMIZED CONTACT ITEM
+class ContactListItem extends StatelessWidget {
+  final Contact contact;
+  final bool isForForwarding;
+  final VoidCallback onInvite;
+  final VoidCallback onTap;
+
+  const ContactListItem({
+    super.key,
+    required this.contact,
+    required this.isForForwarding,
+    required this.onInvite,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      elevation: 1,
+      margin: const EdgeInsets.symmetric(vertical: 4.0),
+      child: ListTile(
+        leading: CircleAvatar(
+          backgroundColor: contact.isOnApp
+              ? const Color(0xFF25D366)
+              : Colors.grey,
+          child: const Icon(Icons.person, color: Colors.white),
+        ),
+        title: Text(
+          contact.contactName.isNotEmpty
+              ? contact.contactName
+              : contact.contactPhone,
+          style: const TextStyle(fontWeight: FontWeight.w500),
+        ),
+        subtitle: contact.contactName.isNotEmpty
+            ? Text(contact.contactPhone)
+            : null,
+        trailing: contact.isOnApp
+            ? const Icon(Icons.chat, color: Color(0xFF075E54))
+            : TextButton(
+          onPressed: onInvite,
+          child: const Text(
+            "INVITE",
+            style: TextStyle(
+              color: Color(0xFF25D366),
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+        onTap: onTap,
       ),
     );
   }
