@@ -619,8 +619,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       );
 
       if (pickedFile != null) {
+        // ✅ PRINT ORIGINAL IMAGE SIZE
+        final originalFile = File(pickedFile.path);
+        final originalSize = await originalFile.length();
+        final imageProperties = await _getImageDimensions(originalFile);
+
+        print("🖼️ ORIGINAL IMAGE INFO:");
+        print("   📁 File: ${pickedFile.path}");
+        print("   📊 Size: ${(originalSize / 1024 / 1024).toStringAsFixed(2)} MB");
+        print("   📐 Dimensions: ${imageProperties['width']}x${imageProperties['height']}");
+        print("   ⚙️ Max allowed: ${_maxImageWidth}x${_maxImageHeight}");
+        print("   🎯 Quality: $_imageQuality%");
+
         setState(() {
-          _imageFile = File(pickedFile.path);
+          _imageFile = originalFile;
           _focusNode.unfocus();
         });
 
@@ -628,6 +640,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
     } catch (e) {
       print("Error picking image: $e");
+    }
+  }
+
+  // ✅ GET IMAGE DIMENSIONS
+  Future<Map<String, double>> _getImageDimensions(File imageFile) async {
+    try {
+      final decodedImage = await decodeImageFromList(await imageFile.readAsBytes());
+      return {
+        'width': decodedImage.width.toDouble(),
+        'height': decodedImage.height.toDouble(),
+      };
+    } catch (e) {
+      print("❌ Error getting image dimensions: $e");
+      return {'width': 0, 'height': 0};
     }
   }
 
@@ -648,7 +674,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     try {
       if (_imageFile != null) {
-        print("🚀 Sending high quality media...");
+        print("🚀 SENDING IMAGE INFO:");
+
+        // ✅ PRINT SENDING IMAGE DETAILS
+        final sendingFile = _imageFile!;
+        final sendingSize = await sendingFile.length();
+        final sendingDimensions = await _getImageDimensions(sendingFile);
+
+        print("   📤 Sending Image:");
+        print("   📁 Path: ${sendingFile.path}");
+        print("   📊 Size: ${(sendingSize / 1024 / 1024).toStringAsFixed(2)} MB");
+        print("   📐 Dimensions: ${sendingDimensions['width']}x${sendingDimensions['height']}");
+        print("   ⚙️ Settings: ${_maxImageWidth}x${_maxImageHeight} at $_imageQuality% quality");
 
         _jumpToBottom();
 
@@ -782,6 +819,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           final cachedFile = snapshot.data!;
           _loadedFullImages.add(msg.messageId);
 
+          // ✅ PRINT CACHED IMAGE INFO
+          _printCachedImageInfo(cachedFile, mediaUrl);
+
           return Image.file(
             cachedFile,
             fit: BoxFit.cover,
@@ -802,6 +842,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         }
       },
     );
+  }
+
+  // ✅ PRINT CACHED IMAGE INFORMATION
+  void _printCachedImageInfo(File cachedFile, String mediaUrl) async {
+    try {
+      final fileSize = await cachedFile.length();
+      final dimensions = await _getImageDimensions(cachedFile);
+
+      print("💾 CACHED IMAGE INFO:");
+      print("   📁 URL: $mediaUrl");
+      print("   💽 Cache Path: ${cachedFile.path}");
+      print("   📊 Size: ${(fileSize / 1024).toStringAsFixed(2)} KB");
+      print("   📐 Dimensions: ${dimensions['width']}x${dimensions['height']}");
+      print("   ✅ Status: Loaded from cache");
+    } catch (e) {
+      print("❌ Error printing cached image info: $e");
+    }
   }
 
   // ✅ FIXED: DIRECT BLUR PREVIEW - NO BLINKING, NO WHITE SPACE
@@ -856,17 +913,30 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       final appDir = await getTemporaryDirectory();
       final cacheFile = File('${appDir.path}/$fileName');
 
+      print("📥 DOWNLOADING IMAGE:");
+      print("   🔗 URL: $mediaUrl");
+      print("   💾 Cache Path: ${cacheFile.path}");
+
       // Download image
       final response = await http.get(Uri.parse(mediaUrl));
       if (response.statusCode == 200) {
+        final fileSize = response.bodyBytes.length;
         await cacheFile.writeAsBytes(response.bodyBytes);
         _imageCache[mediaUrl] = cacheFile;
+
+        // ✅ PRINT DOWNLOADED IMAGE INFO
+        final dimensions = await _getImageDimensions(cacheFile);
+        print("   ✅ DOWNLOAD COMPLETE:");
+        print("   📊 Size: ${(fileSize / 1024).toStringAsFixed(2)} KB");
+        print("   📐 Dimensions: ${dimensions['width']}x${dimensions['height']}");
+        print("   🎯 Cached successfully: $fileName");
 
         // Update UI
         if (mounted) {
           setState(() {});
         }
-        print("✅ Image cached: $fileName");
+      } else {
+        print("   ❌ Download failed: HTTP ${response.statusCode}");
       }
     } catch (e) {
       print('❌ Image download failed: $e');
@@ -918,6 +988,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final tempId = msg.messageId.toString();
     final uploadProgress = _uploadProgress[tempId];
     final isUploading = uploadProgress != null && uploadProgress < 100;
+
+    // ✅ PRINT LOCAL IMAGE INFO
+    _printLocalImageInfo(localPath);
 
     return GestureDetector(
       onTap: () {
@@ -1009,6 +1082,25 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ),
       ),
     );
+  }
+
+  // ✅ PRINT LOCAL IMAGE INFORMATION
+  void _printLocalImageInfo(String localPath) async {
+    try {
+      final file = File(localPath);
+      if (await file.exists()) {
+        final fileSize = await file.length();
+        final dimensions = await _getImageDimensions(file);
+
+        print("📱 LOCAL IMAGE INFO:");
+        print("   📁 Path: $localPath");
+        print("   📊 Size: ${(fileSize / 1024).toStringAsFixed(2)} KB");
+        print("   📐 Dimensions: ${dimensions['width']}x${dimensions['height']}");
+        print("   🏷️ Type: Local file");
+      }
+    } catch (e) {
+      print("❌ Error printing local image info: $e");
+    }
   }
 
   // ✅ FIXED: WHATSAPP-STYLE MESSAGE TICKS
