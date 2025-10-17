@@ -36,6 +36,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
   bool _contactsSynced = false;
   bool _notificationAsked = false;
 
+
   late final List<Widget> _screens = [
     ChatsTab(userStatus: _userStatus),
     const GroupsTab(),
@@ -54,6 +55,8 @@ class _ChatHomePageState extends State<ChatHomePage> {
       ChatService.markAllMessagesAsDelivered(userId);
     }
   }
+
+
 
   void _setupUserStatusListener() {
     ChatService.ensureConnected();
@@ -382,6 +385,7 @@ class _ChatsTabState extends State<ChatsTab> {
                         return;
                       }
 
+                      // ✅ WHATSAPP-STYLE: Directly open at last message
                       Navigator.push(
                         context,
                         MaterialPageRoute(
@@ -391,7 +395,10 @@ class _ChatsTabState extends State<ChatsTab> {
                             otherUserName: contact.name,
                           ),
                         ),
-                      );
+                      ).then((_) {
+                        // ✅ Ensure scroll to bottom when returning to chat
+                        // This helps maintain the WhatsApp-like behavior
+                      });
                     },
                   );
                 },

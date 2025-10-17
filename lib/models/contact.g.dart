@@ -24,13 +24,15 @@ class ContactAdapter extends TypeAdapter<Contact> {
       isOnApp: fields[4] as bool,
       appUserId: fields[5] as int?,
       updatedAt: fields[6] as DateTime?,
+      isDeleted: fields[7] as bool,
+      lastMessageTime: fields[8] as DateTime,
     );
   }
 
   @override
   void write(BinaryWriter writer, Contact obj) {
     writer
-      ..writeByte(7)
+      ..writeByte(9)
       ..writeByte(0)
       ..write(obj.contactId)
       ..writeByte(1)
@@ -44,7 +46,11 @@ class ContactAdapter extends TypeAdapter<Contact> {
       ..writeByte(5)
       ..write(obj.appUserId)
       ..writeByte(6)
-      ..write(obj.updatedAt);
+      ..write(obj.updatedAt)
+      ..writeByte(7)
+      ..write(obj.isDeleted)
+      ..writeByte(8)
+      ..write(obj.lastMessageTime);
   }
 
   @override

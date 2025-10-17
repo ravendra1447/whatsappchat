@@ -22,9 +22,15 @@ class Contact extends HiveObject {
   @HiveField(5)
   int? appUserId;
 
-  // नया field add करें
   @HiveField(6)
   DateTime? updatedAt;
+
+  @HiveField(7)
+  bool isDeleted;
+
+  // ✅ 8. Last Message Time field जोड़ा गया
+  @HiveField(8)
+  DateTime lastMessageTime; // Now a part of the Hive object
 
   Contact({
     required this.contactId,
@@ -33,7 +39,10 @@ class Contact extends HiveObject {
     required this.contactPhone,
     this.isOnApp = false,
     this.appUserId,
-    this.updatedAt, // constructor में add करें
+    this.updatedAt,
+    this.isDeleted = false,
+    // ✅ 9. lastMessageTime constructor में शामिल किया गया
+    required this.lastMessageTime,
   });
 
   factory Contact.fromJson(Map<String, dynamic> json) {
@@ -48,7 +57,26 @@ class Contact extends HiveObject {
           : null,
       updatedAt: json["updated_at"] != null
           ? DateTime.parse(json["updated_at"].toString())
-          : null, // JSON से parse करें
+          : null,
+      isDeleted: false,
+      // ✅ 10. lastMessageTime के लिए एक डिफ़ॉल्ट मान (जैसे एक बहुत पुरानी तारीख) दिया गया है।
+      // यह मान लिया गया है कि API response में यह नहीं होता, लेकिन constructor में ज़रूरी है।
+      lastMessageTime: DateTime(2000),
     );
+  }
+
+  // 🟢 toJson method जोड़ा गया ताकि यह JSON में एन्कोड हो सके
+  Map<String, dynamic> toJson() {
+    return {
+      'contact_id': contactId,
+      'owner_user_id': ownerUserId,
+      'contact_name': contactName,
+      'contact_phone': contactPhone,
+      'is_on_app': isOnApp ? 1 : 0, // आमतौर पर API 1/0 की उम्मीद करता है
+      'app_user_id': appUserId,
+      'is_deleted': isDeleted ? 1 : 0, // आमतौर पर API 1/0 की उम्मीद करता है
+      'updated_at': updatedAt?.toIso8601String(),
+      'last_message_time': lastMessageTime.toIso8601String(),
+    };
   }
 }

@@ -1,3 +1,7 @@
+import 'dart:isolate';
+import 'dart:ui';
+import 'dart:developer'; // Added for logging
+
 import 'package:flutter/material.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -7,9 +11,11 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'package:whatsappchat/models/chat_model.dart';
 import 'package:whatsappchat/models/contact.dart';
+import 'package:whatsappchat/screens/contact_list_page.dart';
 import 'package:whatsappchat/services/local_auth_service.dart';
 import 'package:whatsappchat/services/chat_service.dart';
 import 'package:whatsappchat/services/my_firebase_messaging_service.dart';
+import 'package:whatsappchat/services/contact_service_optimized.dart'; // ✅ NEW: Optimized Service Import
 import 'package:whatsappchat/screens/chat_home.dart' hide Contact;
 import 'package:whatsappchat/screens/phone_otp_login.dart';
 import 'package:whatsappchat/screens/verify_mpin_page.dart';
@@ -105,6 +111,7 @@ class ContactAdapter extends TypeAdapter<Contact> {
     final fields = <int, dynamic>{
       for (int i = 0; i < numOfFields; i++) reader.readByte(): reader.read(),
     };
+    // Ensure all fields used by the service are read
     return Contact(
       contactId: fields[0] as int,
       ownerUserId: fields[1] as int,
@@ -112,13 +119,18 @@ class ContactAdapter extends TypeAdapter<Contact> {
       contactPhone: fields[3] as String,
       isOnApp: fields[4] as bool,
       appUserId: fields[5] as int?,
+      // ✅ Added fields to be consistent with Contact model used in service
+      isDeleted: fields[6] as bool,
+      updatedAt: fields[7] as DateTime,
+      lastMessageTime: fields[8] as DateTime,
     );
   }
 
   @override
   void write(BinaryWriter writer, Contact obj) {
+    // ✅ Updated to write all 9 fields (0-8)
     writer
-      ..writeByte(6)
+      ..writeByte(9) // Total number of fields
       ..writeByte(0)
       ..write(obj.contactId)
       ..writeByte(1)
@@ -130,7 +142,14 @@ class ContactAdapter extends TypeAdapter<Contact> {
       ..writeByte(4)
       ..write(obj.isOnApp)
       ..writeByte(5)
-      ..write(obj.appUserId);
+      ..write(obj.appUserId)
+    // ✅ New fields for service compatibility
+      ..writeByte(6)
+      ..write(obj.isDeleted)
+      ..writeByte(7)
+      ..write(obj.updatedAt)
+      ..writeByte(8)
+      ..write(obj.lastMessageTime);
   }
 }
 
@@ -188,9 +207,16 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
 // ----------------- MAIN -----------------
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  //ImpellerInitializer.disable();
+
+
+
 
   // Firebase Init
   await Firebase.initializeApp();
+
+  // ❌ REMOVED: startupSync call. The sync will be triggered later via Isolate.spawn.
+  // ContactService.startupSync(ownerUserId: 0);
 
   // Hive Init
   await Hive.initFlutter();
@@ -202,6 +228,7 @@ Future<void> main() async {
   await Hive.openBox<Contact>('contacts');
   await Hive.openBox('meta');
   await Hive.openBox('authBox');
+
 
   // FCM Background Handler Registration
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
@@ -309,6 +336,7 @@ class _SplashGateState extends State<SplashGate> {
   }
 
   Future<void> _decideRoute() async {
+    // 2-second delay for splash screen visibility
     await Future.delayed(const Duration(seconds: 2));
 
     final hasUser = LocalAuthService.isLoggedIn();
@@ -317,18 +345,38 @@ class _SplashGateState extends State<SplashGate> {
     if (!mounted) return;
 
     if (!hasUser) {
+      // User not logged in, go to Phone Login
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(builder: (_) => const PhoneLoginPage()),
       );
     } else {
+      // User is logged in
+
+      // ✅ CRITICAL FIX: Background Contact Sync Trigger
+      // Heavy contact sync को main thread को block किए बिना Isolate में शुरू करें
+      if (userId != null && userId > 0) {
+        log('Starting background contact sync for User ID: $userId');
+        try {
+          await Isolate.spawn(fetchPhoneContactsInIsolate, {
+            'ownerUserId': userId,
+            'rootIsolateToken': RootIsolateToken.instance,
+          });
+          log('Background Contact Sync successfully triggered.');
+        } catch (e) {
+          log('Error spawning contact isolate: $e');
+        }
+      }
+
       final hasMpin = LocalAuthService.hasMpin();
       if (hasMpin) {
+        // Go to MPIN verification page
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(builder: (_) => const VerifyMpinPage()),
         );
       } else {
+        // Go to Chat Home page directly
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(builder: (_) => const ChatHomePage()),
