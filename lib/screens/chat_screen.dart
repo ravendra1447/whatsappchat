@@ -22,7 +22,6 @@ import '../services/local_auth_service.dart';
 import '../services/contact_service.dart';
 import 'new_chat_page.dart';
 import 'media_viewer_screen.dart';
-import '../widgets/chat_image.dart';
 
 // Helper function to format date headers
 String formatDateHeader(DateTime date) {
@@ -97,15 +96,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   // ✅ UPLOAD PROGRESS TRACKING
   final Map<String, double> _uploadProgress = {};
 
-  // ✅ WHATSAPP-STYLE IMAGE CACHE - NO BLINKING, NO WHITE SPACE
+  // ✅ WHATSAPP-STYLE IMAGE CACHE - LOW QUALITY FIRST, THEN HD
   final Map<String, File> _imageCache = {};
   final Set<String> _imageDownloadInProgress = {};
   final Set<String> _loadedFullImages = {};
-
-  // ✅ WHATSAPP-LIKE IMAGE QUALITY SETTINGS
-  static const double _maxImageWidth = 1080;
-  static const double _maxImageHeight = 1920;
-  static const int _imageQuality = 75;
 
   // ✅ LOAD MORE MESSAGES
   DateTime _oldestMessageTime = DateTime.now();
@@ -117,27 +111,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   set _areMessagesLoaded(bool value) {
     _authBox.put('messages_loaded_${widget.chatId}', value);
-  }
-
-  // ✅ THUMBNAIL URL GENERATOR
-  String _generateThumbnailUrl(String fullImageUrl) {
-    if (fullImageUrl.contains('_full.')) {
-      return fullImageUrl.replaceAll('_full.', '_thumb.');
-    }
-
-    if (fullImageUrl.contains('.jpg')) {
-      return fullImageUrl.replaceAll('.jpg', '_thumb.jpg');
-    }
-
-    if (fullImageUrl.contains('.jpeg')) {
-      return fullImageUrl.replaceAll('.jpeg', '_thumb.jpeg');
-    }
-
-    if (fullImageUrl.contains('.png')) {
-      return fullImageUrl.replaceAll('.png', '_thumb.png');
-    }
-
-    return fullImageUrl;
   }
 
   // ✅ API BASE URL
@@ -203,6 +176,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
         if (existingMessage == null) {
           print("💾 New message from socket: ${msg.messageId}");
+          print("📸 Low quality URL available: ${msg.lowQualityUrl != null && msg.lowQualityUrl!.isNotEmpty}");
+          print("📸 Low quality URL value: ${msg.lowQualityUrl}");
+
           await _resolveHeader();
           if (_shouldScrollToBottom) {
             _jumpToBottom();
@@ -533,6 +509,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         return;
       }
 
+      // ✅ EXTENDED DEBUG FOR LOW QUALITY URL
+      final lowQualityUrl = data["low_quality_url"]?.toString();
+      print("🔍 INCOMING MESSAGE DEBUG:");
+      print("   - Message ID: $idToProcess");
+      print("   - Low Quality URL: $lowQualityUrl");
+      print("   - Low Quality URL Length: ${lowQualityUrl?.length ?? 0}");
+      print("   - Low Quality URL Valid: ${lowQualityUrl != null && lowQualityUrl!.isNotEmpty}");
+
       final msg = Message(
         messageId: idToProcess,
         chatId: int.tryParse(data["chat_id"]?.toString() ?? "0") ?? 0,
@@ -547,10 +531,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         receiverName: data["receiver_name"]?.toString(),
         senderPhoneNumber: data["sender_phone"]?.toString(),
         receiverPhoneNumber: data["receiver_phone"]?.toString(),
+        lowQualityUrl: lowQualityUrl, // ✅ IMPORTANT: Store low quality URL
       );
 
       await ChatService.saveMessageLocal(msg);
-      print("💾 Saved incoming message: $idToProcess");
+      print("💾 Saved incoming message: $idToProcess, Low Quality: ${msg.lowQualityUrl != null && msg.lowQualityUrl!.isNotEmpty}");
 
     } catch (e) {
       print("❌ Error handling incoming data: $e");
@@ -613,26 +598,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     try {
       final XFile? pickedFile = await _imagePicker.pickImage(
         source: ImageSource.gallery,
-        imageQuality: _imageQuality,
-        maxWidth: _maxImageWidth,
-        maxHeight: _maxImageHeight,
+        imageQuality: 75,
+        maxWidth: 1080,
+        maxHeight: 1920,
       );
 
       if (pickedFile != null) {
-        // ✅ PRINT ORIGINAL IMAGE SIZE
-        final originalFile = File(pickedFile.path);
-        final originalSize = await originalFile.length();
-        final imageProperties = await _getImageDimensions(originalFile);
-
-        print("🖼️ ORIGINAL IMAGE INFO:");
-        print("   📁 File: ${pickedFile.path}");
-        print("   📊 Size: ${(originalSize / 1024 / 1024).toStringAsFixed(2)} MB");
-        print("   📐 Dimensions: ${imageProperties['width']}x${imageProperties['height']}");
-        print("   ⚙️ Max allowed: ${_maxImageWidth}x${_maxImageHeight}");
-        print("   🎯 Quality: $_imageQuality%");
-
         setState(() {
-          _imageFile = originalFile;
+          _imageFile = File(pickedFile.path);
           _focusNode.unfocus();
         });
 
@@ -640,20 +613,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
     } catch (e) {
       print("Error picking image: $e");
-    }
-  }
-
-  // ✅ GET IMAGE DIMENSIONS
-  Future<Map<String, double>> _getImageDimensions(File imageFile) async {
-    try {
-      final decodedImage = await decodeImageFromList(await imageFile.readAsBytes());
-      return {
-        'width': decodedImage.width.toDouble(),
-        'height': decodedImage.height.toDouble(),
-      };
-    } catch (e) {
-      print("❌ Error getting image dimensions: $e");
-      return {'width': 0, 'height': 0};
     }
   }
 
@@ -674,19 +633,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     try {
       if (_imageFile != null) {
-        print("🚀 SENDING IMAGE INFO:");
-
-        // ✅ PRINT SENDING IMAGE DETAILS
-        final sendingFile = _imageFile!;
-        final sendingSize = await sendingFile.length();
-        final sendingDimensions = await _getImageDimensions(sendingFile);
-
-        print("   📤 Sending Image:");
-        print("   📁 Path: ${sendingFile.path}");
-        print("   📊 Size: ${(sendingSize / 1024 / 1024).toStringAsFixed(2)} MB");
-        print("   📐 Dimensions: ${sendingDimensions['width']}x${sendingDimensions['height']}");
-        print("   ⚙️ Settings: ${_maxImageWidth}x${_maxImageHeight} at $_imageQuality% quality");
-
         _jumpToBottom();
 
         await ChatService.sendMediaMessage(
@@ -809,93 +755,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ✅ FIXED: WHATSAPP-STYLE IMAGE LOADING - NO BLINKING, NO WHITE SPACE
-  Widget _buildWhatsAppStyleImage(Message msg, String mediaUrl) {
-    return FutureBuilder<File?>(
-      future: _getCachedImage(mediaUrl),
-      builder: (context, snapshot) {
-        // ✅ CASE 1: Image already cached - SHOW HD IMMEDIATELY
-        if (snapshot.hasData && snapshot.data != null) {
-          final cachedFile = snapshot.data!;
-          _loadedFullImages.add(msg.messageId);
-
-          // ✅ PRINT CACHED IMAGE INFO
-          _printCachedImageInfo(cachedFile, mediaUrl);
-
-          return Image.file(
-            cachedFile,
-            fit: BoxFit.cover,
-            width: double.infinity,
-            height: double.infinity,
-          );
-        }
-
-        // ✅ CASE 2: Downloading - Show INSTANT BLUR PREVIEW
-        else {
-          // Start background download if not already started
-          if (!_imageDownloadInProgress.contains(msg.messageId)) {
-            _imageDownloadInProgress.add(msg.messageId);
-            _downloadAndCacheImage(mediaUrl, msg.messageId);
-          }
-
-          return _buildDirectBlurPreview(mediaUrl);
-        }
-      },
-    );
-  }
-
-  // ✅ PRINT CACHED IMAGE INFORMATION
-  void _printCachedImageInfo(File cachedFile, String mediaUrl) async {
-    try {
-      final fileSize = await cachedFile.length();
-      final dimensions = await _getImageDimensions(cachedFile);
-
-      print("💾 CACHED IMAGE INFO:");
-      print("   📁 URL: $mediaUrl");
-      print("   💽 Cache Path: ${cachedFile.path}");
-      print("   📊 Size: ${(fileSize / 1024).toStringAsFixed(2)} KB");
-      print("   📐 Dimensions: ${dimensions['width']}x${dimensions['height']}");
-      print("   ✅ Status: Loaded from cache");
-    } catch (e) {
-      print("❌ Error printing cached image info: $e");
-    }
-  }
-
-  // ✅ FIXED: DIRECT BLUR PREVIEW - NO BLINKING, NO WHITE SPACE
-  Widget _buildDirectBlurPreview(String mediaUrl) {
-    return CachedNetworkImage(
-      imageUrl: _generateThumbnailUrl(mediaUrl),
-      fit: BoxFit.cover,
-      width: double.infinity,
-      height: double.infinity,
-      placeholder: (context, url) => Container(
-        color: Colors.grey[300], // Grey background - NO WHITE
-        child: Center(
-          child: Container(
-            width: 40,
-            height: 40,
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: Colors.black.withOpacity(0.3),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: const CircularProgressIndicator(
-              strokeWidth: 2,
-              valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-            ),
-          ),
-        ),
-      ),
-      errorWidget: (context, url, error) => Container(
-        color: Colors.grey[300], // Grey background - NO WHITE
-        child: const Icon(Icons.image, color: Colors.grey, size: 40),
-      ),
-      fadeInDuration: Duration.zero, // NO FADE - INSTANT SHOW
-      fadeOutDuration: Duration.zero,
-    );
-  }
-
-  // ✅ WHATSAPP-STYLE IMAGE CACHE MANAGEMENT - NO BLINKING
+  // ✅ WHATSAPP-STYLE IMAGE CACHE MANAGEMENT
   Future<File?> _getCachedImage(String mediaUrl) async {
     final fileName = mediaUrl.split('/').last;
     final appDir = await getTemporaryDirectory();
@@ -913,36 +773,199 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       final appDir = await getTemporaryDirectory();
       final cacheFile = File('${appDir.path}/$fileName');
 
-      print("📥 DOWNLOADING IMAGE:");
-      print("   🔗 URL: $mediaUrl");
-      print("   💾 Cache Path: ${cacheFile.path}");
+      // Skip if already cached
+      if (await cacheFile.exists()) {
+        if (mounted) {
+          setState(() {});
+        }
+        return;
+      }
 
-      // Download image
+      print("📥 DOWNLOADING HD IMAGE FOR RECEIVER: $mediaUrl");
+
+      // Download HD image
       final response = await http.get(Uri.parse(mediaUrl));
       if (response.statusCode == 200) {
-        final fileSize = response.bodyBytes.length;
         await cacheFile.writeAsBytes(response.bodyBytes);
         _imageCache[mediaUrl] = cacheFile;
 
-        // ✅ PRINT DOWNLOADED IMAGE INFO
-        final dimensions = await _getImageDimensions(cacheFile);
-        print("   ✅ DOWNLOAD COMPLETE:");
-        print("   📊 Size: ${(fileSize / 1024).toStringAsFixed(2)} KB");
-        print("   📐 Dimensions: ${dimensions['width']}x${dimensions['height']}");
-        print("   🎯 Cached successfully: $fileName");
+        print("✅ HD IMAGE DOWNLOAD COMPLETE");
 
-        // Update UI
+        // Update UI to show HD image
         if (mounted) {
           setState(() {});
         }
       } else {
-        print("   ❌ Download failed: HTTP ${response.statusCode}");
+        print("❌ HD image download failed: HTTP ${response.statusCode}");
       }
     } catch (e) {
-      print('❌ Image download failed: $e');
+      print('❌ HD image download failed: $e');
     } finally {
       _imageDownloadInProgress.remove(messageId);
     }
+  }
+
+  // ✅ WHATSAPP-STYLE IMAGE LOADING: LOW QUALITY FIRST, THEN HD
+  Widget _buildWhatsAppStyleImage(Message msg, String mediaUrl) {
+    final userId = LocalAuthService.getUserId();
+    final bool isMe = msg.senderId == userId;
+
+    // ✅ SENDER: DIRECT HD IMAGE (NO LOADING)
+    if (isMe) {
+      return CachedNetworkImage(
+        imageUrl: mediaUrl,
+        fit: BoxFit.cover,
+        width: double.infinity,
+        height: double.infinity,
+        placeholder: (context, url) => _buildBlurPlaceholder(),
+        errorWidget: (context, url, error) => _buildBlurPlaceholder(),
+        fadeInDuration: const Duration(milliseconds: 200),
+      );
+    }
+
+    // ✅ RECEIVER: LOW QUALITY FIRST (FROM SERVER), THEN HD
+    else {
+      final lowQualityUrl = msg.lowQualityUrl;
+
+      // ✅ CASE 1: LOW QUALITY URL AVAILABLE - SHOW BLUR FIRST
+      if (lowQualityUrl != null && lowQualityUrl.isNotEmpty) {
+        print("🔄 WhatsApp Style: Low quality available - $lowQualityUrl");
+
+        return Stack(
+          children: [
+            // ✅ LOW QUALITY BLUR IMAGE
+            CachedNetworkImage(
+              imageUrl: lowQualityUrl,
+              fit: BoxFit.cover,
+              width: double.infinity,
+              height: double.infinity,
+              placeholder: (context, url) => _buildBlurPlaceholder(),
+              errorWidget: (context, url, error) {
+                print("❌ Low quality failed, showing HD directly");
+                return CachedNetworkImage(
+                  imageUrl: mediaUrl,
+                  fit: BoxFit.cover,
+                  placeholder: (context, url) => _buildBlurPlaceholder(),
+                );
+              },
+              fadeInDuration: Duration.zero,
+            ),
+
+            // ✅ HD IMAGE LOADING IN BACKGROUND
+            FutureBuilder<File?>(
+              future: _getCachedImage(mediaUrl),
+              builder: (context, snapshot) {
+                // Start background download if not already started
+                if (!_imageDownloadInProgress.contains(msg.messageId) &&
+                    !snapshot.hasData) {
+                  _imageDownloadInProgress.add(msg.messageId);
+                  _downloadAndCacheImage(mediaUrl, msg.messageId);
+                }
+
+                // ✅ WHEN HD READY - FADE IN OVER LOW QUALITY
+                if (snapshot.hasData && snapshot.data != null) {
+                  _loadedFullImages.add(msg.messageId);
+
+                  return ClipRRect(
+                    child: Image.file(
+                      snapshot.data!,
+                      fit: BoxFit.cover,
+                      width: double.infinity,
+                      height: double.infinity,
+                    ),
+                  );
+                }
+
+                // ✅ STILL DOWNLOADING - SHOW ONLY LOW QUALITY
+                return const SizedBox.shrink();
+              },
+            ),
+          ],
+        );
+      }
+
+      // ✅ CASE 2: NO LOW QUALITY - DIRECT HD WITH LOADING
+      else {
+        print("⚠️ No low quality URL, showing HD with loading");
+        return FutureBuilder<File?>(
+          future: _getCachedImage(mediaUrl),
+          builder: (context, snapshot) {
+            // Start background download if not already started
+            if (!_imageDownloadInProgress.contains(msg.messageId) &&
+                !snapshot.hasData) {
+              _imageDownloadInProgress.add(msg.messageId);
+              _downloadAndCacheImage(mediaUrl, msg.messageId);
+            }
+
+            // ✅ HD IMAGE CACHED - SHOW HD
+            if (snapshot.hasData && snapshot.data != null) {
+              _loadedFullImages.add(msg.messageId);
+
+              return Image.file(
+                snapshot.data!,
+                fit: BoxFit.cover,
+                width: double.infinity,
+                height: double.infinity,
+              );
+            }
+
+            // ✅ STILL DOWNLOADING - SHOW LOADING
+            return _buildBlurPlaceholder();
+          },
+        );
+      }
+    }
+  }
+
+  // ✅ IMPROVED BLUR PLACEHOLDER - BETTER THAN GREY
+  Widget _buildBlurPlaceholder() {
+    return Container(
+      width: double.infinity,
+      height: double.infinity,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            Colors.grey[300]!,
+            Colors.grey[400]!,
+            Colors.grey[300]!,
+          ],
+        ),
+      ),
+      child: Stack(
+        children: [
+          // Blur effect
+          Container(
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.3),
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+          // Grid pattern for blur effect
+          Container(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Colors.white.withOpacity(0.1),
+                  Colors.transparent,
+                  Colors.white.withOpacity(0.1),
+                ],
+              ),
+            ),
+          ),
+          const Center(
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   // ✅ OPTIMIZED DATE HEADER
@@ -965,10 +988,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // ✅ FIXED: BETTER MEDIA ERROR WIDGET - NO BLINKING
+  // ✅ FIXED: BETTER MEDIA ERROR WIDGET
   Widget _buildMediaError(String url, String error) {
     return Container(
-      color: Colors.grey[300], // Grey background - NO WHITE
+      color: Colors.grey[300],
       child: const Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
@@ -983,14 +1006,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // ✅ WHATSAPP-STYLE LOCAL MEDIA PREVIEW - NO BLINKING
+  // ✅ WHATSAPP-STYLE LOCAL MEDIA PREVIEW
   Widget _buildLocalMediaPreview(String localPath, Message msg, bool isMe) {
     final tempId = msg.messageId.toString();
     final uploadProgress = _uploadProgress[tempId];
     final isUploading = uploadProgress != null && uploadProgress < 100;
-
-    // ✅ PRINT LOCAL IMAGE INFO
-    _printLocalImageInfo(localPath);
 
     return GestureDetector(
       onTap: () {
@@ -1011,13 +1031,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ),
         child: Stack(
           children: [
-            // ✅ INSTANT LOCAL IMAGE SHOW - NO BLINKING
+            // ✅ INSTANT LOCAL IMAGE SHOW
             ClipRRect(
               borderRadius: BorderRadius.circular(8),
               child: Container(
                 width: MediaQuery.of(context).size.width * 0.65,
                 height: 300,
-                color: Colors.grey[300], // Grey background - NO WHITE
+                color: Colors.grey[300],
                 child: Image.file(
                   File(localPath),
                   fit: BoxFit.cover,
@@ -1084,25 +1104,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // ✅ PRINT LOCAL IMAGE INFORMATION
-  void _printLocalImageInfo(String localPath) async {
-    try {
-      final file = File(localPath);
-      if (await file.exists()) {
-        final fileSize = await file.length();
-        final dimensions = await _getImageDimensions(file);
-
-        print("📱 LOCAL IMAGE INFO:");
-        print("   📁 Path: $localPath");
-        print("   📊 Size: ${(fileSize / 1024).toStringAsFixed(2)} KB");
-        print("   📐 Dimensions: ${dimensions['width']}x${dimensions['height']}");
-        print("   🏷️ Type: Local file");
-      }
-    } catch (e) {
-      print("❌ Error printing local image info: $e");
-    }
-  }
-
   // ✅ FIXED: WHATSAPP-STYLE MESSAGE TICKS
   Widget _buildMessageTicks(Message msg, {bool isUploading = false}) {
     if (isUploading) {
@@ -1134,7 +1135,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ✅ ULTRA-FAST MEDIA LOADING - WhatsApp Style (NO BLINKING, NO WHITE SPACE)
+  // ✅ ULTRA-FAST MEDIA LOADING - WhatsApp Style
   Widget _buildMediaMessage(Message msg, String mediaUrl, Color textColor) {
     final userId = LocalAuthService.getUserId();
     final bool isMe = msg.senderId == userId;
@@ -1147,7 +1148,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return _buildLocalMediaPreview(mediaUrl, msg, isMe);
     }
 
-    // ✅ WHATSAPP-STYLE: FAST DOWNLOAD WITH BLUR PREVIEW (NO BLINKING, NO WHITE SPACE)
+    // ✅ WHATSAPP-STYLE: DIFFERENT BEHAVIOR FOR SENDER VS RECEIVER
     return GestureDetector(
       onTap: () => _openImageFullScreen(msg),
       child: Container(
@@ -1156,19 +1157,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ),
         child: Stack(
           children: [
-            // ✅ WHATSAPP-STYLE IMAGE LOADING - NO BLINKING, NO WHITE SPACE
+            // ✅ SMART IMAGE LOADING BASED ON USER ROLE
             ClipRRect(
               borderRadius: BorderRadius.circular(8),
               child: Container(
                 width: MediaQuery.of(context).size.width * 0.65,
                 height: 300,
-                color: Colors.grey[300], // Grey background - NO WHITE
+                color: Colors.grey[300],
                 child: _buildWhatsAppStyleImage(msg, mediaUrl),
               ),
             ),
 
-            // ✅ UPLOAD PROGRESS
-            if (isUploading && uploadProgress != null)
+            // ✅ UPLOAD PROGRESS (for sender only)
+            if (isMe && isUploading && uploadProgress != null)
               Positioned(
                 top: 8,
                 right: 8,
@@ -1184,6 +1185,28 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       color: Colors.white,
                       fontSize: 10,
                       fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ),
+
+            // ✅ DEBUG INFO - SHOW LOW QUALITY STATUS
+            if (msg.lowQualityUrl != null && msg.lowQualityUrl!.isNotEmpty)
+              Positioned(
+                top: 8,
+                left: 8,
+                child: Container(
+                  padding: const EdgeInsets.all(4),
+                  decoration: BoxDecoration(
+                    color: Colors.green,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: const Text(
+                    'LQ',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 8,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
                 ),

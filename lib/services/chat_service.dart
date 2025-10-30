@@ -17,7 +17,7 @@ import 'package:video_compress/video_compress.dart';
 
 import '../config.dart';
 import '../main.dart';
-import '../models/chat_model.dart';
+import '../models/chat_model.dart' hide Chat;
 import 'crypto_manager.dart';
 import '../utils/sound_utils.dart';
 
@@ -466,6 +466,13 @@ class ChatService {
 
       print("📥 Processing message from $source: $idToProcess");
 
+      // ✅ EXTENDED DEBUG - CHECK LOW QUALITY URL
+      print("🔍 LOW QUALITY URL DEBUG:");
+      print("   - Low Quality URL: ${data["low_quality_url"]}");
+      print("   - Low Quality URL Type: ${data["low_quality_url"]?.runtimeType}");
+      print("   - Low Quality URL Length: ${data["low_quality_url"]?.length ?? 0}");
+      print("   - Low Quality URL Valid: ${data["low_quality_url"] != null && data["low_quality_url"]!.isNotEmpty}");
+
       // ✅ STRONG DUPLICATE PROTECTION - Multiple layers
       if (_processedMessageIds.contains(idToProcess)) {
         print("⚠️ Message already being processed: $idToProcess");
@@ -512,12 +519,17 @@ class ChatService {
       final chatId = int.tryParse(data["chat_id"]?.toString() ?? "0") ?? 0;
       final senderId = int.tryParse(data["sender_id"]?.toString() ?? "0") ?? 0;
 
+      // ✅ CRITICAL: Extract low quality URL properly
+      final lowQualityUrl = data["low_quality_url"]?.toString();
+
       String finalContent = messageContent;
       String finalMessageType = messageType;
+      String? finalLowQualityUrl = lowQualityUrl;
 
       print("🔄 Processing content:");
       print("   Type: $messageType");
       print("   Media URL: $mediaUrl");
+      print("   Low Quality URL: $lowQualityUrl");
       print("   Temp ID: $tempId");
       print("   Message ID: $messageId");
 
@@ -530,6 +542,12 @@ class ChatService {
             final fileName = mediaUrl.split('/').last;
             finalContent = '${Config.baseNodeApiUrl}/media/file/$fileName';
             finalMessageType = "media";
+
+            // ✅ PRESERVE LOW QUALITY URL FOR MEDIA MESSAGES
+            if (lowQualityUrl != null && lowQualityUrl.isNotEmpty) {
+              finalLowQualityUrl = lowQualityUrl;
+              print("✅ Preserved low quality URL for encrypted media: $finalLowQualityUrl");
+            }
             print("✅ Converted to media message: $finalContent");
           } else {
             // Try actual decryption for text messages
@@ -546,6 +564,12 @@ class ChatService {
             final fileName = mediaUrl.split('/').last;
             finalContent = '${Config.baseNodeApiUrl}/media/file/$fileName';
             finalMessageType = "media";
+
+            // ✅ PRESERVE LOW QUALITY URL IN FALLBACK
+            if (lowQualityUrl != null && lowQualityUrl.isNotEmpty) {
+              finalLowQualityUrl = lowQualityUrl;
+              print("✅ Preserved low quality URL in fallback: $finalLowQualityUrl");
+            }
             print("🔄 Fallback to media message: $finalContent");
           } else {
             finalContent = "[Decryption Failed]";
@@ -565,6 +589,21 @@ class ChatService {
           }
 
           finalMessageType = "media";
+
+          // ✅ CRITICAL: Handle low quality URL for media messages
+          if (lowQualityUrl != null && lowQualityUrl.isNotEmpty) {
+            // Check if low quality URL needs to be converted to full URL
+            if (lowQualityUrl.startsWith('/uploads/')) {
+              final lowQualityFileName = lowQualityUrl.split('/').last;
+              finalLowQualityUrl = '${Config.baseNodeApiUrl}/media/file/$lowQualityFileName';
+            } else if (!lowQualityUrl.startsWith('http')) {
+              finalLowQualityUrl = '${Config.baseNodeApiUrl}$lowQualityUrl';
+            }
+            print("✅ Low quality URL processed: $finalLowQualityUrl");
+          } else {
+            print("⚠️ Media message but no low quality URL provided");
+          }
+
           print("✅ Media message processed: $finalContent");
 
           // Test the media URL
@@ -616,11 +655,14 @@ class ChatService {
         receiverName: data["receiver_name"]?.toString(),
         senderPhoneNumber: data["sender_phone"]?.toString(),
         receiverPhoneNumber: data["receiver_phone"]?.toString(),
+        lowQualityUrl: finalLowQualityUrl, // ✅ Use the processed low quality URL
       );
 
       // ✅ FIX: SAVE TO HIVE BUT DON'T IMMEDIATELY EMIT STREAM EVENT
       await saveMessageLocal(msg);
       print("💾 Message saved successfully: $idToProcess");
+      print("💾 Message saved with low quality URL: ${msg.lowQualityUrl != null && msg.lowQualityUrl!.isNotEmpty}");
+      print("💾 Final Low Quality URL: ${msg.lowQualityUrl}");
 
       // ✅ FIX: DELAYED STREAM EVENT - PREVENT MULTIPLE UI UPDATES
       Future.delayed(const Duration(milliseconds: 100), () {
@@ -629,6 +671,7 @@ class ChatService {
         if (finalCheck != null && _newMessageController.hasListener) {
           _newMessageController.add(msg);
           print("📢 Stream event emitted: $idToProcess");
+          print("📢 Stream event with low quality URL: ${msg.lowQualityUrl != null && msg.lowQualityUrl!.isNotEmpty}");
         }
       });
 

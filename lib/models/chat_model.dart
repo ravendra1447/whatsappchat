@@ -36,16 +36,20 @@ class Message extends HiveObject {
   @HiveField(8)
   int isDelivered;
 
-  // 💡 NEW FIELDS: Deletion Status (फील्ड 9-12 के बाद 13 और 14 का उपयोग करें)
+  // 💡 NEW FIELDS: Deletion Status
   @HiveField(13)
   int isDeletedSender; // 0=false, 1=true
 
   @HiveField(14)
   int isDeletedReceiver; // 0=false, 1=true
 
-  // ✅ NEW: Thumbnail for media preview (फील्ड 15 का उपयोग करें)
+  // ✅ Thumbnail for media preview
   @HiveField(15)
   Uint8List? thumbnail;
+
+  // ✅ NEW: Low quality URL for WhatsApp-style image loading
+  @HiveField(16)
+  String? lowQualityUrl;
 
   // Existing optional fields
   @HiveField(9)
@@ -77,7 +81,8 @@ class Message extends HiveObject {
     // Set default values for new deletion fields
     this.isDeletedSender = 0,
     this.isDeletedReceiver = 0,
-    this.thumbnail, // ✅ NEW: Thumbnail field added
+    this.thumbnail,
+    this.lowQualityUrl, // ✅ NEW: Low quality URL field
   });
 
   factory Message.fromMap(Map<String, dynamic> map) {
@@ -92,11 +97,11 @@ class Message extends HiveObject {
       parsedMessageId = 'unknown';
     }
 
-    // Deletion fields को मैप से सुरक्षित रूप से पढ़ें (अगर वे API से आ रहे हैं, वरना 0)
+    // Deletion fields को मैप से सुरक्षित रूप से पढ़ें
     final int isDeletedSender = map['is_deleted_sender'] as int? ?? 0;
     final int isDeletedReceiver = map['is_deleted_receiver'] as int? ?? 0;
 
-    // ✅ NEW: Thumbnail parsing (अगर server से base64 format में आता है)
+    // ✅ Thumbnail parsing
     Uint8List? parsedThumbnail;
     if (map['thumbnail'] != null && map['thumbnail'] is String) {
       try {
@@ -106,7 +111,10 @@ class Message extends HiveObject {
       }
     }
 
-    // Time parsing logic...
+    // ✅ NEW: Low quality URL parsing
+    final String? parsedLowQualityUrl = map['low_quality_url']?.toString();
+
+    // Time parsing logic
     DateTime parsedTimestamp;
     final dynamic timestampData = map['timestamp'];
     if (timestampData is int) {
@@ -134,12 +142,43 @@ class Message extends HiveObject {
       // New fields mapped
       isDeletedSender: isDeletedSender,
       isDeletedReceiver: isDeletedReceiver,
-      thumbnail: parsedThumbnail, // ✅ NEW: Thumbnail included
+      thumbnail: parsedThumbnail,
+      lowQualityUrl: parsedLowQualityUrl, // ✅ NEW: Low quality URL included
     );
+  }
+
+  // ✅ Factory method for JSON (socket data ke liye)
+  factory Message.fromJson(Map<String, dynamic> json) {
+    return Message.fromMap(json);
+  }
+
+  // ✅ Convert to Map for sending to server
+  Map<String, dynamic> toMap() {
+    return {
+      'message_id': messageId,
+      'chat_id': chatId,
+      'sender_id': senderId,
+      'receiver_id': receiverId,
+      'message_text': messageContent,
+      'message_type': messageType,
+      'is_read': isRead,
+      'timestamp': timestamp.toIso8601String(),
+      'is_delivered': isDelivered,
+      'sender_name': senderName,
+      'receiver_name': receiverName,
+      'sender_phone_number': senderPhoneNumber,
+      'receiver_phone_number': receiverPhoneNumber,
+      'is_deleted_sender': isDeletedSender,
+      'is_deleted_receiver': isDeletedReceiver,
+      'low_quality_url': lowQualityUrl, // ✅ NEW: Include in map
+    };
   }
 
   // ✅ OPTIONAL: Helper method to check if message has thumbnail
   bool get hasThumbnail => thumbnail != null && thumbnail!.isNotEmpty;
+
+  // ✅ NEW: Helper method to check if message has low quality URL
+  bool get hasLowQualityUrl => lowQualityUrl != null && lowQualityUrl!.isNotEmpty;
 
   // ✅ OPTIONAL: Helper method to get display content for media messages
   String get displayContent {
@@ -147,5 +186,103 @@ class Message extends HiveObject {
       return hasThumbnail ? '📷 Image' : '📷 Media';
     }
     return messageContent;
+  }
+
+  // ✅ NEW: Copy with method for updating fields
+  Message copyWith({
+    String? messageId,
+    int? chatId,
+    int? senderId,
+    int? receiverId,
+    String? messageContent,
+    String? messageType,
+    int? isRead,
+    DateTime? timestamp,
+    int? isDelivered,
+    int? isDeletedSender,
+    int? isDeletedReceiver,
+    Uint8List? thumbnail,
+    String? lowQualityUrl,
+    String? senderName,
+    String? receiverName,
+    String? senderPhoneNumber,
+    String? receiverPhoneNumber,
+  }) {
+    return Message(
+      messageId: messageId ?? this.messageId,
+      chatId: chatId ?? this.chatId,
+      senderId: senderId ?? this.senderId,
+      receiverId: receiverId ?? this.receiverId,
+      messageContent: messageContent ?? this.messageContent,
+      messageType: messageType ?? this.messageType,
+      isRead: isRead ?? this.isRead,
+      timestamp: timestamp ?? this.timestamp,
+      isDelivered: isDelivered ?? this.isDelivered,
+      senderName: senderName ?? this.senderName,
+      receiverName: receiverName ?? this.receiverName,
+      senderPhoneNumber: senderPhoneNumber ?? this.senderPhoneNumber,
+      receiverPhoneNumber: receiverPhoneNumber ?? this.receiverPhoneNumber,
+      isDeletedSender: isDeletedSender ?? this.isDeletedSender,
+      isDeletedReceiver: isDeletedReceiver ?? this.isDeletedReceiver,
+      thumbnail: thumbnail ?? this.thumbnail,
+      lowQualityUrl: lowQualityUrl ?? this.lowQualityUrl,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'Message('
+        'messageId: $messageId, '
+        'chatId: $chatId, '
+        'senderId: $senderId, '
+        'receiverId: $receiverId, '
+        'messageType: $messageType, '
+        'isRead: $isRead, '
+        'isDelivered: $isDelivered, '
+        'hasLowQualityUrl: $hasLowQualityUrl, '
+        'timestamp: $timestamp'
+        ')';
+  }
+}
+
+// ✅ Optional: Chat model agar aapke paas hai
+@HiveType(typeId: 1)
+class Chat extends HiveObject {
+  @HiveField(0)
+  int chatId;
+
+  @HiveField(1)
+  int contactId;
+
+  @HiveField(2)
+  List<int> userIds;
+
+  @HiveField(3)
+  String chatTitle;
+
+  @HiveField(4)
+  DateTime lastMessageTime;
+
+  @HiveField(5)
+  String lastMessage;
+
+  Chat({
+    required this.chatId,
+    required this.contactId,
+    required this.userIds,
+    required this.chatTitle,
+    required this.lastMessageTime,
+    required this.lastMessage,
+  });
+
+  factory Chat.fromMap(Map<String, dynamic> map) {
+    return Chat(
+      chatId: map['chat_id'] as int? ?? 0,
+      contactId: map['contact_id'] as int? ?? 0,
+      userIds: (map['user_ids'] as List<dynamic>?)?.cast<int>() ?? [],
+      chatTitle: map['chat_title'] as String? ?? '',
+      lastMessageTime: DateTime.tryParse(map['last_message_time']?.toString() ?? '') ?? DateTime.now(),
+      lastMessage: map['last_message'] as String? ?? '',
+    );
   }
 }
