@@ -2135,6 +2135,72 @@ class _AddProductBasicInfoScreenState extends State<AddProductBasicInfoScreen> {
   }
 
   Future<void> _addNewColor() async {
+    print('🔍 DEBUG: _addNewColor called in AddProductBasicInfoScreen');
+    
+    // TEMPORARY TEST: Always show company check result
+    final userId = LocalAuthService.getUserId();
+    print('🔍 DEBUG: Current User ID: $userId');
+    
+    // Check if user has company registered
+    final hasCompany = await _checkUserCompany();
+    print('🔍 DEBUG: hasCompany result in AddProductBasicInfoScreen: $hasCompany');
+    
+    // TEMPORARY: Force show registration dialog for testing
+    if (!hasCompany) { // Simple blocking check
+      print('🔍 DEBUG: FORCING registration dialog for testing');
+      // Show company registration dialog first
+      final registered = await _showCompanyRegistrationDialog();
+      print('🔍 DEBUG: Registration dialog result: $registered');
+      
+      if (!registered) {
+        // User cancelled registration, don't proceed
+        print('🔍 DEBUG: User cancelled registration');
+        return;
+      }
+      
+      // Check again after registration
+      final hasCompanyAfter = await _checkUserCompany();
+      print('🔍 DEBUG: hasCompany after registration: $hasCompanyAfter');
+      
+      if (!hasCompanyAfter) {
+        // Registration failed or was incomplete
+        print('🔍 DEBUG: Registration failed, showing error');
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Company registration is required to add product colors'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+        return;
+      }
+    }
+    
+    if (!hasCompany) {
+      print('🔍 DEBUG: No company found, showing registration dialog');
+      // Show company registration dialog first
+      final registered = await _showCompanyRegistrationDialog();
+      print('🔍 DEBUG: Registration dialog result: $registered');
+      
+      if (!registered) {
+        // User cancelled registration, don't proceed
+        return;
+      }
+      
+      // Check again after registration
+      final hasCompanyAfter = await _checkUserCompany();
+      if (!hasCompanyAfter) {
+        // Registration failed or was incomplete
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Company registration is required to add product colors'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+        return;
+      }
+    }
+    
+    // Company is registered, proceed with camera
     final result = await Navigator.push<List<File>>(
       context,
       MaterialPageRoute(
@@ -2227,19 +2293,8 @@ class _AddProductBasicInfoScreenState extends State<AddProductBasicInfoScreen> {
     try {
       print('🚀 _saveProduct called with type: $type');
       
-      // DEBUG: Add test button check
       if (type == 'publish') {
-        print('🧪 DEBUG: Testing company check before publish...');
-        
-        // Test company check with detailed logging
-        print('🔍 Checking user company for published product...');
         final hasCompany = await _checkUserCompany();
-        print('📊 Has company: $hasCompany');
-        
-        // Force show registration dialog for testing (remove this line in production)
-        // final hasCompany = false; // Uncomment this line to force registration dialog
-        
-        print('🎯 Company check result: $hasCompany');
         
         if (!hasCompany) {
           print('❌ No company found - showing registration dialog');
@@ -4729,144 +4784,57 @@ class _AddProductBasicInfoScreenState extends State<AddProductBasicInfoScreen> {
               padding: AppSpacing.paddingHorizontalLG.add(AppSpacing.paddingVerticalSM),
               child: Column(
                 children: [
-                  // DEBUG: Test buttons (remove in production)
-                  if (true) // Set to false to hide debug buttons
-                    Column(
-                      children: [
-                        // Server connectivity test
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 5),
-                          child: SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton(
-                              onPressed: () async {
-                                print('🧪 DEBUG: Testing server connectivity...');
-                                try {
-                                  final url = '${Config.baseNodeApiUrl}/users/test';
-                                  print('🌐 Calling test endpoint: $url');
+                  // Force auto-registration test (keep this one)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton(
+                        onPressed: () async {
+                          print('🔧 DEBUG: Force auto-registration test...');
+                          
+                          // Get user info first
+                          final userId = LocalAuthService.getUserId();
+                          if (userId != null) {
+                            try {
+                              final url = '${Config.baseNodeApiUrl}/users/user-info-by-id/${userId.toString()}';
+                              final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
+                              
+                              if (response.statusCode == 200) {
+                                final data = json.decode(response.body);
+                                if (data['success'] && data['data'] != null) {
+                                  final userInfo = data['data'];
+                                  print('👤 Forcing auto-registration for: ${userInfo['name']}');
                                   
-                                  final response = await http.get(
-                                    Uri.parse(url),
-                                  ).timeout(const Duration(seconds: 5));
-                                  
-                                  print('📡 Response status: ${response.statusCode}');
-                                  print('📡 Response body: ${response.body}');
-                                  
-                                  if (response.statusCode == 200) {
-                                    final data = json.decode(response.body);
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      SnackBar(
-                                        content: Text('✅ Server Connected: ${data['message']}'),
-                                        backgroundColor: Colors.green,
-                                      ),
-                                    );
-                                  } else {
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      SnackBar(
-                                        content: Text('❌ Server Error: ${response.statusCode}'),
-                                        backgroundColor: Colors.red,
-                                      ),
-                                    );
-                                  }
-                                } catch (e) {
-                                  print('❌ Server test failed: $e');
+                                  final registered = await _autoRegisterCompanyForAdmin(userInfo);
                                   ScaffoldMessenger.of(context).showSnackBar(
                                     SnackBar(
-                                      content: Text('❌ Server Connection Failed: $e'),
-                                      backgroundColor: Colors.red,
+                                      content: Text('Auto-Registration: ${registered ? "SUCCESS" : "FAILED"}'),
+                                      backgroundColor: registered ? Colors.green : Colors.red,
                                     ),
                                   );
                                 }
-                              },
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.blue,
-                                foregroundColor: Colors.white,
-                                padding: const EdgeInsets.symmetric(vertical: 10),
-                              ),
-                              child: const Text('🌐 DEBUG: Test Server Connection'),
-                            ),
-                          ),
+                              }
+                            } catch (e) {
+                              print('❌ Force registration error: $e');
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text('Error: $e'),
+                                  backgroundColor: Colors.red,
+                                ),
+                              );
+                            }
+                          }
+                        },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.red,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 10),
                         ),
-                        
-                        // Company check test
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 5),
-                          child: SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton(
-                              onPressed: () async {
-                                print('🧪 DEBUG: Manual company check test...');
-                                final hasCompany = await _checkUserCompany();
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(
-                                    content: Text('Company Status: ${hasCompany ? "Registered" : "Not Registered"}'),
-                                    backgroundColor: hasCompany ? Colors.green : Colors.orange,
-                                  ),
-                                );
-                              },
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.purple,
-                                foregroundColor: Colors.white,
-                                padding: const EdgeInsets.symmetric(vertical: 10),
-                              ),
-                              child: const Text('🏢 DEBUG: Test Company Check'),
-                            ),
-                          ),
-                        ),
-                        
-                        // Force auto-registration test
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 10),
-                          child: SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton(
-                              onPressed: () async {
-                                print('🔧 DEBUG: Force auto-registration test...');
-                                
-                                // Get user info first
-                                final userId = LocalAuthService.getUserId();
-                                if (userId != null) {
-                                  try {
-                                    final url = '${Config.baseNodeApiUrl}/users/user-info-by-id/${userId.toString()}';
-                                    final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
-                                    
-                                    if (response.statusCode == 200) {
-                                      final data = json.decode(response.body);
-                                      if (data['success'] && data['data'] != null) {
-                                        final userInfo = data['data'];
-                                        print('👤 Forcing auto-registration for: ${userInfo['name']}');
-                                        
-                                        final registered = await _autoRegisterCompanyForAdmin(userInfo);
-                                        ScaffoldMessenger.of(context).showSnackBar(
-                                          SnackBar(
-                                            content: Text('Auto-Registration: ${registered ? "SUCCESS" : "FAILED"}'),
-                                            backgroundColor: registered ? Colors.green : Colors.red,
-                                          ),
-                                        );
-                                      }
-                                    }
-                                  } catch (e) {
-                                    print('❌ Force registration error: $e');
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      SnackBar(
-                                        content: Text('Error: $e'),
-                                        backgroundColor: Colors.red,
-                                      ),
-                                    );
-                                  }
-                                }
-                              },
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.red,
-                                foregroundColor: Colors.white,
-                                padding: const EdgeInsets.symmetric(vertical: 10),
-                              ),
-                              child: const Text('🔧 DEBUG: Force Auto-Register'),
-                            ),
-                          ),
-                        ),
-                      ],
+                        child: const Text('🔧 DEBUG: Force Auto-Register'),
+                      ),
                     ),
+                  ),
                   
                   // Main buttons
                   Row(
@@ -5214,7 +5182,281 @@ class _AddProductPriceMoqScreenState extends State<AddProductPriceMoqScreen> {
     }
   }
 
+  // Check if user has company
+  Future<bool> _checkUserCompany() async {
+    try {
+      print('🔍 _checkUserCompany called');
+      final userId = LocalAuthService.getUserId();
+      print('👤 User ID: $userId');
+      
+      if (userId == null) {
+        print('❌ User ID is null');
+        return false;
+      }
+
+      // Method 1: Try API first with new endpoint
+      try {
+        final url = '${Config.baseNodeApiUrl}/users/user-info-by-id/${userId.toString()}';
+        print('🌐 Calling API: $url');
+        
+        final response = await http.get(
+          Uri.parse(url),
+        ).timeout(const Duration(seconds: 10));
+        
+        print('📡 Response status: ${response.statusCode}');
+        print('📡 Response body: ${response.body}');
+        
+        if (response.statusCode == 200) {
+          final data = json.decode(response.body);
+          print('📊 Parsed data: $data');
+          
+          if (data['success'] && data['data'] != null) {
+            final userInfo = data['data'];
+            print('👤 User info: $userInfo');
+            
+            // Check if user has company_id and branch_id
+            final hasCompany = userInfo['company_id'] != null && 
+                              userInfo['branch_id'] != null &&
+                              userInfo['company_id'].toString().isNotEmpty &&
+                              userInfo['branch_id'].toString().isNotEmpty;
+            print('🏢 Company ID: ${userInfo['company_id']}');
+            print('🏢 Branch ID: ${userInfo['branch_id']}');
+            print('👤 User Role: ${userInfo['role']}');
+            print('📊 Has company: $hasCompany');
+            
+            // Special handling for admin users without company
+            if (!hasCompany) {
+              print('🔑 User without company - checking role...');
+              print('👤 User role: ${userInfo['role']}');
+              
+              if (userInfo['role'] == 'admin') {
+                print('🔑 Admin user without company - attempting auto-registration...');
+                
+                // Try to auto-create company for admin
+                final autoRegistered = await _autoRegisterCompanyForAdmin(userInfo);
+                if (autoRegistered) {
+                  print('✅ Admin company auto-registered successfully');
+                  return true; // Now has company
+                } else {
+                  print('❌ Admin auto-registration failed - showing manual registration');
+                }
+              } else {
+                print('👤 Non-admin user - showing manual registration');
+              }
+            }
+            
+            return hasCompany;
+          } else {
+            print('❌ API returned success: false or no data');
+          }
+        } else {
+          print('❌ API failed with status: ${response.statusCode}');
+        }
+      } catch (e) {
+        print('❌ API call failed: $e');
+      }
+      
+      return false;
+    } catch (e) {
+      print('❌ _checkUserCompany error: $e');
+      return false;
+    }
+  }
+
+  // Show company registration dialog
+  Future<bool> _showCompanyRegistrationDialog() async {
+    try {
+      // Get user phone number
+      final userId = LocalAuthService.getUserId();
+      if (userId == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('User not logged in')),
+        );
+        return false;
+      }
+
+      // Get user info to get phone number
+      final response = await http.get(
+        Uri.parse('${Config.baseNodeApiUrl}/users/user-info/${userId.toString()}'),
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data['success']) {
+          final userInfo = data['data'];
+          final userPhone = userInfo['phone'];
+
+          if (userPhone != null) {
+            // Show registration screen
+            final registered = await Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (context) => CompanyRegistrationScreen(
+                  userPhone: userPhone,
+                  userId: userId.toString(),
+                ),
+              ),
+            );
+
+            return registered == true;
+          }
+        }
+      }
+      
+      return false;
+    } catch (e) {
+      print('Error showing registration dialog: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return false;
+    }
+  }
+
+  // Auto register company for admin
+  Future<bool> _autoRegisterCompanyForAdmin(Map<String, dynamic> userInfo) async {
+    try {
+      final userId = userInfo['id'];
+      final userName = userInfo['name'] ?? 'Admin User';
+      final userPhone = userInfo['phone'] ?? '0000000000';
+      final userEmail = userInfo['email'] ?? 'admin@example.com';
+
+      print('🔧 Auto-registering company for admin user: $userId');
+
+      // Create company registration payload
+      final companyPayload = {
+        'user_id': userId,
+        'company_name': '$userName Company',
+        'company_type': 'Manufacturer',
+        'industry_type': 'Textiles',
+        'address': 'Default Address',
+        'city': 'Default City',
+        'state': 'Default State',
+        'pincode': '000000',
+        'country': 'India',
+        'phone': userPhone,
+        'email': userEmail,
+        'website': '',
+        'description': 'Auto-registered company for admin user',
+        'registration_number': 'AUTO-REG-${DateTime.now().millisecondsSinceEpoch}',
+      };
+
+      // Register company
+      final companyResponse = await http.post(
+        Uri.parse('${Config.baseNodeApiUrl}/company/register'),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode(companyPayload),
+      ).timeout(const Duration(seconds: 15));
+
+      print('📡 Company registration response: ${companyResponse.statusCode}');
+      print('📡 Company registration body: ${companyResponse.body}');
+
+      if (companyResponse.statusCode == 200 || companyResponse.statusCode == 201) {
+        final companyData = json.decode(companyResponse.body);
+        if (companyData['success'] && companyData['data'] != null) {
+          final companyInfo = companyData['data'];
+          final companyId = companyInfo['company_id'] ?? companyInfo['id'];
+
+          if (companyId != null) {
+            // Create branch
+            final branchPayload = {
+              'company_id': companyId,
+              'branch_name': 'Main Branch',
+              'address': 'Default Branch Address',
+              'city': 'Default City',
+              'state': 'Default State',
+              'pincode': '000000',
+              'country': 'India',
+              'phone': userPhone,
+              'email': userEmail,
+              'is_main_branch': true,
+            };
+
+            final branchResponse = await http.post(
+              Uri.parse('${Config.baseNodeApiUrl}/company/branch/register'),
+              headers: {'Content-Type': 'application/json'},
+              body: json.encode(branchPayload),
+            ).timeout(const Duration(seconds: 15));
+
+            print('📡 Branch registration response: ${branchResponse.statusCode}');
+            print('📡 Branch registration body: ${branchResponse.body}');
+
+            if (branchResponse.statusCode == 200 || branchResponse.statusCode == 201) {
+              final branchData = json.decode(branchResponse.body);
+              if (branchData['success'] && branchData['data'] != null) {
+                final branchInfo = branchData['data'];
+                final branchId = branchInfo['branch_id'] ?? branchInfo['id'];
+
+                if (branchId != null) {
+                  // Update user with company and branch IDs
+                  final updatePayload = {
+                    'company_id': companyId,
+                    'branch_id': branchId,
+                  };
+
+                  final updateResponse = await http.put(
+                    Uri.parse('${Config.baseNodeApiUrl}/users/update-user/$userId'),
+                    headers: {'Content-Type': 'application/json'},
+                    body: json.encode(updatePayload),
+                  ).timeout(const Duration(seconds: 15));
+
+                  print('📡 User update response: ${updateResponse.statusCode}');
+                  print('📡 User update body: ${updateResponse.body}');
+
+                  if (updateResponse.statusCode == 200) {
+                    print('✅ Admin company auto-registration completed successfully');
+                    return true;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      print('❌ Admin auto-registration failed');
+      return false;
+    } catch (e) {
+      print('❌ Auto-registration error: $e');
+      return false;
+    }
+  }
+
   Future<void> _addNewColor() async {
+    print('🔍 DEBUG: _addNewColor called in AddProductPriceMoqScreen');
+    // Check if user has company registered
+    final hasCompany = await _checkUserCompany();
+    print('🔍 DEBUG: hasCompany result in AddProductPriceMoqScreen: $hasCompany');
+    
+    if (!hasCompany) {
+      print('🔍 DEBUG: No company found in PriceMoqScreen, showing registration dialog');
+      // Show company registration dialog first
+      final registered = await _showCompanyRegistrationDialog();
+      print('🔍 DEBUG: Registration dialog result in PriceMoqScreen: $registered');
+      
+      if (!registered) {
+        // User cancelled registration, don't proceed
+        return;
+      }
+      
+      // Check again after registration
+      final hasCompanyAfter = await _checkUserCompany();
+      if (!hasCompanyAfter) {
+        // Registration failed or was incomplete
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Company registration is required to add product colors'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+        return;
+      }
+    }
+    
+    // Company is registered, proceed with camera
     final result = await Navigator.push<List<File>>(
       context,
       MaterialPageRoute(

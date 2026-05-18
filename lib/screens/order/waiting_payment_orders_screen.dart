@@ -18,14 +18,14 @@ class _WaitingPaymentOrdersScreenState extends State<WaitingPaymentOrdersScreen>
   List<dynamic> orders = [];
   bool isLoading = true;
   String? errorMessage;
-  
+
   // Auto-refresh variables
   Timer? _refreshTimer;
   bool _isAutoRefreshEnabled = true;
   int _refreshInterval = 10; // seconds
   DateTime? _lastRefreshTime;
   bool _isRefreshing = false;
-  
+
   // Change detection variables
   String? _lastOrderHash;
   int _lastOrderCount = 0;
@@ -63,7 +63,7 @@ class _WaitingPaymentOrdersScreenState extends State<WaitingPaymentOrdersScreen>
           final newOrders = responseData['orders'] ?? [];
           final newOrderCount = newOrders.length;
           final newOrderHash = _generateOrderHash(newOrders);
-          
+
           setState(() {
             orders = newOrders;
             isLoading = false;
@@ -175,13 +175,13 @@ class _WaitingPaymentOrdersScreenState extends State<WaitingPaymentOrdersScreen>
             : orders.isEmpty
             ? _buildEmptyView()
             : ListView.separated(
-                padding: const EdgeInsets.all(16),
-                separatorBuilder: (context, index) => const SizedBox(height: 8),
-                itemCount: orders.length,
-                itemBuilder: (context, index) {
-                  return _buildOrderCard(orders[index]);
-                },
-              ),
+          padding: const EdgeInsets.all(16),
+          separatorBuilder: (context, index) => const SizedBox(height: 8),
+          itemCount: orders.length,
+          itemBuilder: (context, index) {
+            return _buildOrderCard(orders[index]);
+          },
+        ),
       ),
     );
   }
@@ -351,7 +351,7 @@ class _WaitingPaymentOrdersScreenState extends State<WaitingPaymentOrdersScreen>
                   ],
                 ),
                 const SizedBox(height: 12),
-                
+
                 // Customer info row
                 Row(
                   children: [
@@ -374,7 +374,7 @@ class _WaitingPaymentOrdersScreenState extends State<WaitingPaymentOrdersScreen>
                   ],
                 ),
                 const SizedBox(height: 8),
-                
+
                 // Date row
                 Row(
                   children: [
@@ -394,7 +394,7 @@ class _WaitingPaymentOrdersScreenState extends State<WaitingPaymentOrdersScreen>
                   ],
                 ),
                 const SizedBox(height: 12),
-                
+
                 // Amount row
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -461,7 +461,7 @@ class _WaitingPaymentOrdersScreenState extends State<WaitingPaymentOrdersScreen>
     setState(() {
       _isAutoRefreshEnabled = !_isAutoRefreshEnabled;
     });
-    
+
     if (_isAutoRefreshEnabled) {
       _startAutoRefresh();
     } else {
@@ -484,7 +484,7 @@ class _WaitingPaymentOrdersScreenState extends State<WaitingPaymentOrdersScreen>
           final newOrders = responseData['orders'] ?? [];
           final newOrderCount = newOrders.length;
           final newOrderHash = _generateOrderHash(newOrders);
-          
+
           // Only refresh if there are actual changes
           if (newOrderCount != _lastOrderCount || newOrderHash != _lastOrderHash) {
             print('🔄 Changes detected! Refreshing waiting payment orders...');
@@ -519,11 +519,11 @@ class _WaitingPaymentOrdersScreenState extends State<WaitingPaymentOrdersScreen>
   // Generate hash for orders to detect changes
   String _generateOrderHash(List<dynamic> orders) {
     if (orders.isEmpty) return 'empty';
-    
-    final String orderData = orders.map((order) => 
-      '${order['id']}_${order['order_status']}_${order['updated_at']}'
+
+    final String orderData = orders.map((order) =>
+    '${order['id']}_${order['order_status']}_${order['updated_at']}'
     ).join('|');
-    
+
     return orderData.hashCode.toString();
   }
 }

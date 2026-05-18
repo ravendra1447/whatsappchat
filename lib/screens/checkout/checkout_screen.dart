@@ -820,7 +820,22 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
     if (userId == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('User not logged in'),
+          content: Text('Please login first to place order'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    // Validate all required fields before placing order
+    if (_addressController.text.trim().isEmpty ||
+        _cityController.text.trim().isEmpty ||
+        _stateController.text.trim().isEmpty ||
+        _pincodeController.text.trim().isEmpty ||
+        _phoneController.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please fill all shipping details'),
           backgroundColor: Colors.red,
         ),
       );
@@ -980,8 +995,13 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
         body: json.encode(orderData),
       );
 
+      print('Response status code: ${response.statusCode}'); // Debug log
+      print('Response body: ${response.body}'); // Debug log
+
       if (response.statusCode == 200) {
         final responseData = json.decode(response.body);
+        print('Response data: $responseData'); // Debug log
+        
         if (responseData['success']) {
           // Clear cart after successful order
           CartService.clearCart();
@@ -998,10 +1018,10 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
             (route) => false,
           );
         } else {
-          throw Exception(responseData['message']);
+          throw Exception(responseData['message'] ?? 'Order failed');
         }
       } else {
-        throw Exception('Failed to place order');
+        throw Exception('Server error: ${response.statusCode} - ${response.body}');
       }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(

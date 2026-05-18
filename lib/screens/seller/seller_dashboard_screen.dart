@@ -19,6 +19,7 @@ import '../../theme/app_typography.dart';
 import '../../theme/app_spacing.dart';
 import '../../widgets/modern_card.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import '../profile_company/company_registration_screen.dart';
 
 class SellerDashboardScreen extends StatefulWidget {
   const SellerDashboardScreen({super.key});
@@ -542,6 +543,18 @@ class _SellerDashboardScreenState extends State<SellerDashboardScreen> {
           color: Colors.black,
         ),
         actions: [
+          // Company Registration Icon
+          IconButton(
+            icon: Icon(
+              Icons.business_center_outlined,
+              color: Colors.green.shade700,
+              size: 24,
+            ),
+            onPressed: () async {
+              await _showCompanyRegistrationDialog();
+            },
+            tooltip: 'Company Registration',
+          ),
           Stack(
             children: [
               IconButton(
@@ -1012,6 +1025,71 @@ class _SellerDashboardScreenState extends State<SellerDashboardScreen> {
           child: Icon(Icons.image_not_supported, color: Colors.grey),
         ),
       );
+    }
+  }
+
+  // Show company registration dialog
+  Future<bool> _showCompanyRegistrationDialog() async {
+    try {
+      // Get user phone number
+      final userId = LocalAuthService.getUserId();
+      if (userId == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('User not logged in')),
+        );
+        return false;
+      }
+
+      // Get user info to get phone number
+      final response = await http.get(
+        Uri.parse('${Config.baseNodeApiUrl}/users/user-info/${userId.toString()}'),
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data['success']) {
+          final userInfo = data['data'];
+          final userPhone = userInfo['phone'];
+
+          if (userPhone != null) {
+            // Show registration screen
+            final registered = await Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (context) => CompanyRegistrationScreen(
+                  userPhone: userPhone,
+                  userId: userId.toString(),
+                ),
+              ),
+            );
+
+            if (registered == true) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Company registered successfully!'),
+                  backgroundColor: Colors.green,
+                ),
+              );
+              // Refresh seller data after registration
+              _loadSellerProducts();
+              _loadSellerOrderCount();
+            }
+            
+            return registered == true;
+          }
+        }
+      }
+      
+      return false;
+    } catch (e) {
+      print('Error showing registration dialog: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return false;
     }
   }
 }
